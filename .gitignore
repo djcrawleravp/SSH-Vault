@@ -1,0 +1,11 @@
+# Credentials, fingerprints, and local session preferences
+/keys/
+/app/.launcher_state.json
+/app/.launcher-state-*
+
+# Editor and Python cache files
+__pycache__/
+*.py[cod]
+.DS_Store
+*.swp
+*.swo
