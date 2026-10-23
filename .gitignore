@@ -1,9 +1,16 @@
-# Credentials, fingerprints, and local session preferences
+# DO NOT COMMIT SECRETS, exports, decrypted data or backups
 /keys/
+/exported_keys/
+/exported_keys-*/
+/vault.kdbx
+/.vault-backups/
+/.vault-*.kdbx
+/.vault-*.tmp
+/.ssh-vault-export-*/
+/.pytest_cache/
+/.venv/
 /app/.launcher_state.json
 /app/.launcher-state-*
-
-# Editor and Python cache files
 __pycache__/
 *.py[cod]
 .DS_Store

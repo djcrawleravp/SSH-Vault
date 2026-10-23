@@ -17,18 +17,19 @@ import shutil
 import subprocess
 import sys
 import time
+import textwrap
 import atexit
+from startup import password_form, report_screen
 from dataclasses import dataclass
 
+from vault import (VaultStore, VaultError, KDBX, ROOT, INBOX, EXPORT, BACKUPS,
+                   migrate, export_vault, unb64, save_file,
+                   verify_pair)
+from session import backend_stage, changed_payload, login_agent, login_command
+
 APP = Path(__file__).resolve().parent
-ROOT = APP.parent
-KEYS = ROOT / "keys"
-PRIV = KEYS / "priv"
-PUB = KEYS / "pub"
-CONF = KEYS / "config"
-KNOWN_HOSTS = KEYS / "known_hosts"
 BACKEND = APP / "ssh_backend.sh"
-STATE = APP / ".launcher_state.json"  # Portable local UI preference, never SSH credentials.
+ACTIVE_VAULT: VaultStore | None = None
 
 try:
     locale.setlocale(locale.LC_ALL, "")
@@ -36,74 +37,33 @@ except locale.Error:
     pass
 
 
-
 def initialize_storage() -> None:
-    """Create a fresh portable keys store; never write into local ~/.ssh.
-
-    Existing config, fingerprints, and key pairs are never overwritten.
-    """
-    local_ssh = (Path.home() / ".ssh").resolve()
+    """The keys/ import inbox is NEVER created automatically."""
+    local_ssh = (Path.home() / '.ssh').resolve()
     project = ROOT.resolve()
     if project == local_ssh or local_ssh in project.parents:
-        raise OSError("The launcher cannot be stored inside ~/.ssh")
+        raise OSError('Refusing to run from the local ~/.ssh directory')
     if not BACKEND.is_file() or BACKEND.is_symlink():
-        raise OSError(f"Missing or invalid backend: {BACKEND}")
+        raise OSError(f'Missing or invalid backend: {BACKEND}')
 
-    for directory in (KEYS, PRIV, PUB):
-        if directory.is_symlink():
-            raise OSError(f"Refusing symbolic link: {directory}")
-        if directory.exists() and not directory.is_dir():
-            raise OSError(f"Expected a directory: {directory}")
-        directory.mkdir(mode=0o700, parents=False, exist_ok=True)
-        # Restrict access even if the folder came from an older installation.
-        directory.chmod(0o700)
 
-    for file in (CONF, KNOWN_HOSTS):
-        if file.is_symlink() or (file.exists() and not file.is_file()):
-            raise OSError(f"Refusing invalid file: {file}")
-        if not file.exists():
-            try:
-                descriptor = os.open(file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                os.close(descriptor)
-            except FileExistsError:
-                if file.is_symlink() or not file.is_file():
-                    raise OSError(f"Refusing invalid file: {file}")
-        file.chmod(0o600)
+def current_store() -> VaultStore:
+    if ACTIVE_VAULT is None:
+        raise VaultError('Vault has not been unlocked')
+    return ACTIVE_VAULT
 
 
 def last_remote_user() -> str:
-    """Default to root, then suggest the last successfully registered user."""
-    if STATE.is_symlink():
-        return "root"
-    try:
-        data = json.loads(STATE.read_text(encoding="utf-8"))
-        value = data.get("last_remote_user", "root")
-    except (OSError, ValueError, AttributeError, TypeError):
-        return "root"
-    if isinstance(value, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", value):
-        return value
-    return "root"
+    return current_store().data.get('last_user', 'root')
 
 
 def remember_remote_user(user: str) -> None:
-    """Atomically save only a username, never a password or private key."""
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", user):
-        raise ValueError("Invalid SSH username")
-    if STATE.is_symlink():
-        raise OSError(f"Refusing symbolic link: {STATE}")
-    temp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=APP,
-                                         prefix=".launcher-state-", delete=False) as stream:
-            temp_path = Path(stream.name)
-            os.chmod(stream.name, 0o600)
-            json.dump({"last_remote_user": user}, stream, indent=2)
-            stream.write("\n")
-        os.replace(temp_path, STATE)
-    finally:
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
-
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*', user):
+        raise ValueError('Invalid SSH username')
+    vault = current_store()
+    updated = json.loads(json.dumps(vault.data))
+    updated['last_user'] = user
+    vault.save(updated)
 
 @dataclass
 class Server:
@@ -116,81 +76,26 @@ class Server:
     note: str = ""
 
 
-def host_aliases() -> list[str]:
-    """As in the original: only single literal Host entries, not Match or patterns."""
-    aliases = []
-    text = CONF.read_text(encoding="utf-8", errors="replace")
-    for line in text.splitlines():
-        line = line.split("#", 1)[0].strip()
-        tokens = line.split()
-        if len(tokens) == 2 and tokens[0].lower() == "host" and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]*", tokens[1]):
-            if tokens[1] not in aliases:
-                aliases.append(tokens[1])
-    return aliases
-
-
-def effective(alias: str) -> dict[str, str]:
-    """Get OpenSSH's effective values rather than trying to emulate config parsing."""
-    command = ["ssh", "-G", "-F", str(CONF), alias]
+def locally_owned(record: dict) -> bool:
+    """A marker signals intended ownership, NOT verified remote state."""
     try:
-        output = subprocess.run(command, capture_output=True, text=True, timeout=5, cwd=ROOT)
-    except (OSError, subprocess.TimeoutExpired):
-        return {}
-    if output.returncode:
-        return {}
-    result: dict[str, str] = {}
-    for line in output.stdout.splitlines():
-        name, _, value = line.partition(" ")
-        if name == "identityfile":
-            result.setdefault("identityfile", value.strip())
-        else:
-            result[name] = value.strip()
-    return result
-
-
-def find_key(alias: str, config_value: str) -> tuple[str, str]:
-    """Use private keys under keys/priv, including filenames different from aliases.
-
-    Legacy IdentityFile paths are resolved ONLY by basename inside keys/priv.
-    External keys can still be read but are not used for administration.
-    """
-    references = [x for x in config_value.splitlines() if x and x.lower() != "none"]
-    candidates = []
-    for value in references:
-        filename = Path(value.strip().strip('"')).name
-        if filename and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", filename):
-            candidates.append(PRIV / filename)
-    candidates.append(PRIV / alias)
-    for candidate in dict.fromkeys(candidates):
-        if candidate.is_file() and not candidate.is_symlink():
-            return str(candidate), "LOCAL"
-    # External keys are read-only, but should not be preferred over keys/priv.
-    for value in references:
-        if value.startswith("~/"):
-            value = str(Path.home() / value[2:])
-        elif not os.path.isabs(value):
-            value = str(ROOT / value)
-        candidate = Path(value)
-        if candidate.is_file() and not candidate.is_symlink() and os.access(candidate, os.R_OK):
-            return str(candidate), "EXTERNAL"
-    return "", "NO KEY"
+        parts = unb64(record['public']).decode('ascii').split()
+        return (len(parts) == 3 and parts[0] == 'ssh-ed25519'
+                and bool(re.fullmatch(r'ssh-vault-managed-[A-Za-z0-9_-]+', parts[2])))
+    except (ValueError, UnicodeError, KeyError):
+        return False
 
 
 def load_servers() -> list[Server]:
     result = []
-    for alias in host_aliases():
-        options = effective(alias)
-        host = options.get("hostname", "")
-        user = options.get("user", "")
-        port = options.get("port", "22")
-        key, kind = find_key(alias, options.get("identityfile", ""))
-        note = "Configured; remote login not tested"
-        if not host or not user or not port.isdecimal():
-            note = "CHECK CONFIG"
-        elif not key:
-            kind = "OTHER AUTH"
-            note = "No private key found; SSH may use agent or password"
-        result.append(Server(alias, host, user, port, key, kind, note))
+    for alias, rec in sorted(current_store().data['servers'].items()):
+        tagged = locally_owned(rec)
+        result.append(Server(alias=alias, host=rec['host'], user=rec['user'],
+                             port=rec['port'], key=rec['key_name'],
+                             key_kind='TAGGED' if tagged else 'LEGACY',
+                             note=('Vault ownership tag present; use Edit / Verify Remote Key'
+                                   if tagged else
+                                   'Encrypted legacy identity; use Edit / Adopt Remote Key')))
     return result
 
 
@@ -229,12 +134,13 @@ class Launcher:
         self.mouse_enabled = False
         self.last_click = (0.0, -1, -1)
         self.last_mouse = None
+        self.last_activity = time.monotonic()
         self.initialize()
         self.reload()
 
     def initialize(self):
         self.win.keypad(False)
-        self.win.timeout(-1)
+        self.win.timeout(1000)
         if hasattr(curses, "set_escdelay"):
             curses.set_escdelay(70)
         curses.noecho()
@@ -397,7 +303,7 @@ class Launcher:
             # Ignore unsupported escape sequences, do not quit unexpectedly.
             return -1
         finally:
-            self.win.timeout(-1)
+            self.win.timeout(1000)
 
     def curses_mouse_fallback(self):
         """Accept native curses KEY_MOUSE if a terminal emits it anyway."""
@@ -493,8 +399,8 @@ class Launcher:
             self.win.refresh()
             return
         wide = w >= 103
-        self.put(1, 3, "▰  SSH LAUNCHER", style="accent")
-        self.put(1, max(34, w - 30), "PORTABLE  /  OPENSSH", 25, "muted")
+        self.put(1, 3, "▰  SSH VAULT", style="accent")
+        self.put(1, max(34, w - 30), "ENCRYPTED  /  OPENSSH", 25, "muted")
         self.put(2, 3, f"{len(self.servers)} connections  ·  {ROOT}", w - 7, "muted")
         self.rule(3, 3, w - 7)
         self.footer_rows = 2 if h >= 22 else 1
@@ -548,13 +454,13 @@ class Launcher:
             if width > 48:
                 host_space = max(8, width - 44)
                 self.put(y, 24, s.host[:host_space], host_space, style)
-            tag = s.key_kind if s.key_kind in ("LOCAL", "EXTERNAL") else "NO KEY"
+            tag = s.key_kind if s.key_kind in ("TAGGED", "LEGACY") else "NO KEY"
             if picked:
                 self.put(y, 5 + max(0, width - 14), tag, 11, style)
             else:
-                self.put(y, 5 + max(0, width - 14), tag, 11, "good" if tag in ("LOCAL", "EXTERNAL") else "warning")
+                self.put(y, 5 + max(0, width - 14), tag, 11, "good" if tag == "TAGGED" else "warning")
         if not found:
-            self.put(list_top, 7, "No results. N to create or / to search.", width - 5, "muted")
+            self.put(list_top, 7, "No connections. N to create or / to search.", width - 5, "muted")
         if len(found) > visible:
             self.put((bottom - 1) if (wide or compact) else (detail_top - 2), 7,
                      f"{self.scroll+1}-{min(self.scroll + visible, len(found))} / {len(found)} · PgUp/PgDn",
@@ -567,7 +473,7 @@ class Launcher:
         self.put(h - 2, 3, help2, w - 6, "muted")
         status = ("Filter: " + self.query) if self.mode == "search" else self.notice
         if not status:
-            status = "Exiting SSH returns here. Local ~/.ssh is never modified."
+            status = "KDBX4 / Argon2id · Exiting SSH returns here · ~/.ssh untouched."
         self.put(h - 1, 3, status, w - 6, "warning" if self.notice else "muted")
         self.win.refresh()
 
@@ -582,7 +488,7 @@ class Launcher:
         options = [
             ("Menu", "menu"), ("Connect", "connect"), ("New", "create"),
             ("Edit", "edit"), ("Delete", "delete"), ("Search", "search"),
-            ("Reload", "reload"), ("Help", "help"), ("Quit", "quit"),
+            ("Vault", "vault"), ("Reload", "reload"), ("Help", "help"), ("Quit", "quit"),
         ]
         row = h - 4 if self.footer_rows == 2 else h - 3
         last_row = h - 3
@@ -613,10 +519,10 @@ class Launcher:
 
     def action(self, action):
         if action == "menu":
-            commands = ["Connect", "New", "Edit", "Delete", "Search", "Reload", "Help", "Quit"]
+            commands = ["Connect", "New", "Edit", "Delete", "Search", "Vault", "Reload", "Help", "Quit"]
             option = self.menu("MAIN MENU", commands, details="Actions available by mouse or keyboard")
             if option is not None:
-                return self.action(["connect", "create", "edit", "delete", "search", "reload", "help", "quit"][option])
+                return self.action(["connect", "create", "edit", "delete", "search", "vault", "reload", "help", "quit"][option])
         elif action == "connect":
             self.connect()
         elif action == "create":
@@ -627,6 +533,8 @@ class Launcher:
             self.delete()
         elif action == "search":
             self.search()
+        elif action == "vault":
+            self.vault_menu()
         elif action == "reload":
             self.reload()
             self.notice = "Configuration reloaded."
@@ -694,8 +602,8 @@ class Launcher:
             ("Host", s.host or "—"),
             ("User", s.user or "—"),
             ("Port", s.port),
-            ("Key source", s.key_kind),
-            ("Key file", s.key or "No private key found"),
+            ("Identity", s.key_kind),
+            ("Key name", s.key or "Unavailable"),
         ]
         self.put(y, x, "●  " + s.alias, width, "accent")
         max_rows = min(len(items), max(0, bottom - y - 3))
@@ -704,7 +612,7 @@ class Launcher:
             self.put(y + 2 + i, x + 12, value, max(0, width - 13), "normal")
         if bottom - y >= 12:
             self.rule(bottom - 4, x, width)
-            self.put(bottom - 3, x, "LOCAL STATUS", width, "accent")
+            self.put(bottom - 3, x, "VAULT STATUS", width, "accent")
             self.put(bottom - 2, x, s.note, width, "muted")
 
     def centered_box(self, title, lines, width=None):
@@ -724,24 +632,45 @@ class Launcher:
         return top, left, height, width
 
     def popup(self, title, message):
-        """Information dialog: Close works using Enter, Esc, Space or click."""
-        lines = message.splitlines() or ['']
+        """Fully scrollable dialog; mouse/keyboard always close and navigate."""
+        offset = 0
         while True:
             self.show()
-            top, left, height, width = self.centered_box(title, lines + ['', ''], width=65)
+            h, w = self.win.getmaxyx()
+            max_chars = max(15, min(88, w - 14))
+            lines = []
+            for raw in (message.splitlines() or ['']):
+                lines.extend(textwrap.wrap(raw, width=max_chars,
+                           break_long_words=True, break_on_hyphens=False) or [''])
+            visible = max(1, h - 10)
+            offset = max(0, min(offset, max(0, len(lines) - visible)))
+            current = lines[offset:offset + visible]
+            if len(lines) > visible:
+                current += [f'Showing {offset + 1}-{offset + len(current)} of {len(lines)}  (Up/Down to scroll)']
+            top, left, height, width = self.centered_box(title, current + ['', ''], width=65)
             y = top + height - 2
             x = left + 3
             self.put(y, x, '[ CLOSE ]', 9, 'selected')
             self.win.refresh()
             key = self.read_event()
-            if key in (10, 13, 27, ord(' '), ord('q'), ord('Q'),
-                       curses.KEY_ENTER):
+            if key in (10, 13, 27, ord(' '), ord('q'), ord('Q'), curses.KEY_ENTER):
                 return
-            if isinstance(key, Mouse):
-                if key.action in ('left', 'double') and y == key.y and x <= key.x < x + 9:
+            if key in (curses.KEY_UP, ord('k'), ord('K')):
+                offset -= 1
+            elif key in (curses.KEY_DOWN, ord('j'), ord('J')):
+                offset += 1
+            elif key == curses.KEY_PPAGE:
+                offset -= visible
+            elif key == curses.KEY_NPAGE:
+                offset += visible
+            elif isinstance(key, Mouse):
+                if key.action == 'wheel-up':
+                    offset -= 1
+                elif key.action == 'wheel-down':
+                    offset += 1
+                elif key.action in ('left', 'double') and key.y == y and x <= key.x < x + 9:
                     return
-                if key.action == 'right':
-                    return
+            offset = max(0, min(offset, max(0, len(lines) - visible)))
 
     def menu(self, title, choices, details=''):
         """Navigation dialog with explicit SELECT and BACK buttons.
@@ -930,7 +859,7 @@ class Launcher:
                 focus = 'field'
                 value += chr(key)
 
-    def run_external(self, argv, title="SSH OPERATION", pause=True):
+    def run_external(self, argv, title="SSH OPERATION", pause=True, env=None):
         """Hand over the *actual terminal* to SSH or backend, then restore curses.
 
         SSH gets stdin/out and terminal device unmodified. Not wrapped in a pseudo-shell.
@@ -941,10 +870,10 @@ class Launcher:
         curses.endwin()
         try:
             print("\033[2J\033[H", end="", flush=True)
-            print("\n  SSH LAUNCHER  /  " + title)
+            print("\n  SSH VAULT  /  " + title)
             print("  " + "─" * 58 + "\n", flush=True)
             try:
-                code = subprocess.call(argv, cwd=ROOT)
+                code = subprocess.call(argv, cwd=ROOT, env=env)
             except KeyboardInterrupt:
                 code = 130
             except OSError as exc:
@@ -964,6 +893,7 @@ class Launcher:
                 pass
             self.win.clear()
             self.win.refresh()
+        self.last_activity = time.monotonic()  # active SSH is never idle-locked
         self.reload()
         self.notice = f"{title}: {'completed successfully' if code == 0 else f'error ({code})'}"
         if pause:
@@ -972,28 +902,87 @@ class Launcher:
                                          f'Exited with code {code}. See terminal output for diagnostics.'))
         return code
 
-    def ssh_cmd(self, server):
-        # OpenSSH configuration parser needs quotation for paths containing spaces.
-        escaped = str(KNOWN_HOSTS).replace("\\", "\\\\").replace('"', '\\"')
-        cmd = ["ssh", "-F", str(CONF),
-               "-o", 'UserKnownHostsFile="' + escaped + '"',
-               # Trust a *new* fingerprint without interrupting the launcher.
-               # Previously known, changed fingerprints are still rejected.
-               "-o", "StrictHostKeyChecking=accept-new",
-               "-o", "LogLevel=ERROR",
-               "-o", "UpdateHostKeys=no",
-               "-o", "ControlMaster=no", "-o", "ControlPath=none"]
-        if server.key:
-            cmd.extend(["-i", server.key, "-o", "IdentitiesOnly=yes"])
-        cmd.append(server.alias)
-        return cmd
-
     def connect(self):
         s = self.selected()
         if not s:
             return
-        # Interactive SSH, no exec(): connection exit returns here.
-        self.run_external(self.ssh_cmd(s), f"CONNECTION  {s.alias}", pause=False)
+        record = current_store().data['servers'][s.alias]
+        try:
+            private = unb64(record['private'])
+            public = unb64(record['public'])
+            # Only the PUBLIC key and host fingerprints are staged on disk.
+            with login_agent(private) as (agent_env, agent_dir):
+                identity = agent_dir / 'identity.pub'
+                hosts = agent_dir / 'known_hosts'
+                save_file(identity, public, 0o600)
+                save_file(hosts, current_store().data['known_hosts'].encode())
+                self.run_external(login_command(s.alias, record, agent_env, identity, hosts),
+                                  f'CONNECTION {s.alias}', pause=False, env=agent_env)
+                seen = hosts.read_text(encoding='utf-8')
+                if seen != current_store().data['known_hosts']:
+                    updated = json.loads(json.dumps(current_store().data))
+                    updated['known_hosts'] = seen
+                    current_store().save(updated)
+                    self.notice = 'New host fingerprints securely saved to vault.'
+        except (OSError, VaultError, subprocess.CalledProcessError, ValueError) as error:
+            self.popup('SSH CONNECTION FAILED', str(error))
+
+    def run_backend(self, arguments, title):
+        """Stage credentials, persist verified identities, and report actual errors.
+
+        A failed optional sshd policy change must not be reported as a failed
+        connection registration when public-key authentication already worked.
+        """
+        try:
+            # Keep an encrypted recovery snapshot BEFORE attempting remote
+            # revocation. If backup validation fails, do not touch the server.
+            if arguments and arguments[0] == 'delete':
+                current_store().backup_verified()
+            with backend_stage(current_store()) as stage:
+                diag_file = stage / 'operation-diagnostics.txt'
+                save_file(diag_file, b'')  # Only private temp storage; cleaned after operation.
+                env = os.environ.copy()
+                env['SSH_VAULT_WORKDIR'] = str(stage)
+                env['SSH_VAULT_DIAGNOSTIC_FILE'] = str(diag_file)
+                previous = set(current_store().data['servers'])
+                status = self.run_external(['bash', str(BACKEND)] + arguments, title,
+                                           pause=False, env=env)
+                # SSH authorization may succeed while an OPTIONAL sshd change fails.
+                updated = changed_payload(current_store(), stage)
+                saved = updated != current_store().data
+                if saved:
+                    current_store().save(updated)
+                new_servers = sorted(set(updated['servers']) - previous)
+                try:
+                    details = diag_file.read_text(encoding='utf-8', errors='replace').strip()
+                except OSError:
+                    details = ''
+                self.reload()
+            if status == 0:
+                headline = 'OPERATION COMPLETE'
+                message = title + ' completed successfully.'
+            elif new_servers and arguments[0] == 'create' and arguments[-1] == 'no':
+                headline = 'CONNECTION SAVED / SSHD CHANGE FAILED'
+                message = ('Key authentication was verified and the new connection was '
+                           'saved in the encrypted vault. The optional change to SSH '
+                           'password authentication did not complete.')
+            else:
+                headline = 'OPERATION FAILED'
+                message = (title + ' failed (exit code ' + str(status) + '). '
+                           + ('No new connection was stored.' if not saved else
+                              'Verified changes were saved in the encrypted vault.'))
+            if details:
+                # Show details in curses instead of immediately clearing stderr.
+                message += '\n\nDetails: ' + details[-1700:]
+            elif status != 0:
+                message += ('\n\nThe server could not be reached, refused authentication, '
+                            'or the remote command failed. Check IP, port, account, '
+                            'SSH login permissions and server console.')
+            self.popup(headline, message)
+            return status
+        except (VaultError, OSError, ValueError, subprocess.CalledProcessError) as error:
+            self.popup('VAULT UPDATE ERROR', str(error))
+            return 1
 
     def create(self):
         self.notice = ""
@@ -1044,7 +1033,7 @@ class Launcher:
         if disable_password is None:
             return
         mode = "no" if disable_password else "keep"
-        self.run_external(["bash", str(BACKEND), "create", alias, host, user, port, mode], "CREATE CONNECTION")
+        self.run_backend(["create", alias, host, user, port, mode], "CREATE CONNECTION")
         self.reload(alias)
         # Store the most recently registered user only if the connection was
         # actually saved. The key may be saved even if changing remote sshd
@@ -1066,6 +1055,8 @@ class Launcher:
             "Change SSH port",
             "Disable SSH password login (entire server)",
             "Enable SSH password login (entire server)",
+            "Adopt legacy remote key (one authorization only)",
+            "Verify managed remote key",
         ], details=f"{s.alias}  ·  {s.user}@{s.host}:{s.port}")
         if selection is None:
             return
@@ -1076,35 +1067,43 @@ class Launcher:
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", value):
                 self.popup("ERROR", "Invalid alias.")
                 return
-            self.run_external(["bash", str(BACKEND), "rename", s.alias, value], "RENAME CONNECTION")
+            self.run_backend(["rename", s.alias, value], "RENAME CONNECTION")
             self.reload(value)
         elif selection in (1, 2, 3):
-            labels = {1: "New IP / hostname:", 2: "New user:", 3: "New SSH port:"}
-            old = {1: s.host, 2: s.user, 3: s.port}[selection]
-            value = self.prompt("CHANGE HOST", labels[selection], old)
-            if value is None or value == old:
-                return
-            new = [s.host, s.user, s.port]
-            new[selection - 1] = value
-            h, u, p = new
-            if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.:-]*", h)
-                    or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", u)
-                    or not p.isdigit() or not 1 <= int(p) <= 65535):
-                self.popup("ERROR", "Invalid value.")
-                return
-            if not self.confirm("VALIDATE HOST", f"Update {s.alias} to {u}@{h}:{p}?\nThe key will be checked on the new target first."):
-                return
-            self.run_external(["bash", str(BACKEND), "target", s.alias, h, u, p], "UPDATE SERVER")
-        else:
+            self.popup('SAFE TARGET CHANGE',
+                       'Changing a remote host, user or port could leave an orphan '
+                       'authorization on the old server.\n'
+                       'To move securely: create and verify a NEW connection, '
+                       'then Delete the old connection to revoke its remote key.')
+            return
+        elif selection in (4, 5):
             mode = "no" if selection == 4 else "yes"
             verbo = "DISABLE" if mode == "no" else "ENABLE"
             if not self.confirm("SERVER-WIDE SSHD CHANGE", f"{verbo} SSH password login on {s.host}?\nThis affects the ENTIRE server and requires remote sudo.", danger=True):
                 return
-            self.run_external(["bash", str(BACKEND), "passwd", s.alias, mode], "CONFIGURE SSHD")
+            self.run_backend(["passwd", s.alias, mode], "CONFIGURE SSHD")
+        elif selection == 6:
+            if s.key_kind != 'LEGACY':
+                self.popup('ALREADY TAGGED', 'This identity already has a Vault ownership marker.\nUse Verify Remote Key to inspect the authorization.')
+                return
+            if not self.confirm('ADOPT REMOTE KEY',
+                                f'Adopt {s.alias} on {s.user}@{s.host}:{s.port}?\n'
+                                'One unique matching authorized_keys entry is required.\n'
+                                'Its restrictions and original comment will be preserved.\n'
+                                'No unrelated key will be modified.', danger=True):
+                return
+            self.run_backend(['adopt', s.alias], 'ADOPT REMOTE KEY')
+        elif selection == 7:
+            self.run_backend(['verify', s.alias], 'VERIFY MANAGED REMOTE KEY')
 
     def delete(self):
         s = self.selected()
         if not s:
+            return
+        if s.key_kind != 'TAGGED':
+            self.popup('ADOPTION REQUIRED',
+                       'This imported key has no Vault ownership marker.\n'
+                       'Open Edit / Adopt Remote Key first. No local or remote key was removed.')
             return
         if not self.confirm("DELETE CONNECTION", f"Delete '{s.alias}' and revoke its key on host {s.host}?\nThis cannot be undone; you could lose SSH access.", danger=True):
             return
@@ -1118,7 +1117,66 @@ class Launcher:
         if option == 1 and not self.confirm("FINAL CONFIRMATION", "Revoking this key could lock you out of SSH.\nConfirm that another authentication method works?", danger=True):
             return
         mode = "enable_password" if option == 0 else "keep_password"
-        self.run_external(["bash", str(BACKEND), "delete", s.alias, mode], "DELETE CONNECTION")
+        self.run_backend(["delete", s.alias, mode], "DELETE CONNECTION")
+
+    def vault_menu(self):
+        option = self.menu('VAULT MANAGEMENT', [
+            'Import legacy keys/ now',
+            'Export decrypted keys to NEW exported_keys/',
+            'Change master password',
+            'Lock vault and exit',
+        ], details='Encrypted database is always the source of truth.')
+        if option == 0:
+            if not self.confirm('IMPORT LEGACY KEYS',
+                                'Import verified keys from keys/?\n'
+                                'Successfully imported pairs are removed AFTER\n'
+                                'encrypted backup and round-trip verification.'):
+                return
+            try:
+                report = migrate(current_store())
+                self.reload()
+                summary = ('Imported: ' + ', '.join(report['imported']) + '\n'
+                           'Duplicates: ' + ', '.join(report['duplicates']) + '\n'
+                           'Removed key pairs: ' + ', '.join(report['removed_keys']) + '\n'
+                           'Preserved: ' + ', '.join(report['preserved'][:6]) + '\n'
+                           'Problems: ' + '; '.join(report['problems'][:6]))
+                self.popup('MIGRATION REPORT', summary)
+            except (VaultError, OSError, ValueError) as error:
+                self.popup('IMPORT FAILED', str(error))
+        elif option == 1:
+            if not self.confirm('EXPORT UNENCRYPTED IDENTITIES',
+                                'Export private keys in plaintext to a NEW directory?\n'
+                                'Never put exported_keys/ in Git. Existing exports stay intact.',
+                                danger=True):
+                return
+            try:
+                path = export_vault(current_store())
+                self.popup('EXPORT COMPLETE', str(path))
+            except (VaultError, OSError, ValueError) as error:
+                self.popup('EXPORT FAILED', str(error))
+        elif option == 2:
+            if not self.confirm('CHANGE MASTER PASSWORD',
+                                'A new encrypted vault and backup will be verified first.'):
+                return
+            try:
+                new = password_form(self.win, create=True)
+            finally:
+                try:
+                    curses.mousemask(0)
+                except (curses.error, AttributeError):
+                    pass
+                self.disable_mouse()
+                self.enable_mouse()
+                self.win.keypad(False)
+            if new is None:
+                return
+            try:
+                current_store().change_password(new)
+                self.popup('MASTER PASSWORD', 'Master password changed and encrypted vault verified.')
+            except Exception as error:
+                self.popup('PASSWORD UPDATE FAILED', str(error))
+        elif option == 3:
+            self.lock_requested = True
 
     def search(self):
         value = self.prompt("SEARCH CONNECTIONS", "Search alias, hostname or user:", self.query)
@@ -1140,8 +1198,9 @@ class Launcher:
                    '/: search  ·  R: reload  ·  H/?: help  ·  Q/Esc: quit\n'
                    'Tab: focus clickable buttons  ·  Enter: activate focus\n'
                    'Dialogs: Y/N, Tab, arrows, Enter, Esc or click\n'
-                   'LOCAL: private key in keys/priv (not login status).\n'
-                   'Closing SSH returns to the launcher.')
+                   'VAULT: identity protected in KDBX4 (not login status).\n'
+                   'V: vault management · Auto-lock after 10 idle minutes.\n'
+                   'Closing SSH returns here.')
 
     def move(self, delta):
         available = self.rows()
@@ -1155,8 +1214,16 @@ class Launcher:
 
     def loop(self):
         while True:
+            if getattr(self, 'lock_requested', False):
+                break
             self.show()
             key = self.read_event()
+            if key == -1:
+                if time.monotonic() - self.last_activity >= 600:
+                    self.notice = 'Vault locked after 10 minutes of inactivity.'
+                    break
+                continue
+            self.last_activity = time.monotonic()
             if key == curses.KEY_RESIZE:
                 self.win.clear()
                 continue
@@ -1206,6 +1273,8 @@ class Launcher:
                 self.action('delete')
             elif key in (ord('/'), ord('s'), ord('S')):
                 self.action('search')
+            elif key in (ord('v'), ord('V')):
+                self.action('vault')
             elif key in (ord('r'), ord('R')):
                 self.action('reload')
             elif key in (ord('?'), ord('h'), ord('H'), curses.KEY_F1):
@@ -1215,6 +1284,73 @@ class Launcher:
 
 
 def run(win):
+    """Show initial vault entry and migration inside curses, before main launcher.
+
+    ONLY an actual KDBX credential failure triggers another password prompt.
+    Other failures must be reported, never silently interpreted as a bad password.
+    """
+    from pykeepass.exceptions import CredentialsError
+    global ACTIVE_VAULT
+    created = not KDBX.exists()
+    warning = ''
+    rejected = 0
+    while True:
+        password = password_form(win, create=created, previous_error=warning)
+        if password is None:
+            return
+        store = VaultStore(password)
+        try:
+            if created:
+                store.create()
+            else:
+                store.open()
+        except CredentialsError:
+            # KDBX authenticates deterministically: never tell users a general
+            # read or integrity error means they typed the wrong password.
+            if created:
+                report_screen(win, 'VAULT CREATION FAILED',
+                              ['The newly-created vault could not be verified.',
+                               'No existing vault was overwritten.'])
+                return
+            rejected += 1
+            warning = ('Vault rejected the entered password (attempt %d). '
+                       'Check keyboard layout and Caps Lock.' % rejected)
+            continue
+        except Exception as error:
+            # Includes corrupted KDBX, file access errors, schema validation,
+            # memory exhaustion, and other library errors. Re-entering the same
+            # secret cannot be assumed to repair any of these conditions.
+            report_screen(win, 'VAULT CREATION FAILED' if created else 'VAULT OPEN ERROR', [
+                '%s: %s' % (type(error).__name__, str(error)),
+                'This is NOT confirmed to be a wrong master password.',
+                'Your existing encrypted vault has not been replaced.',
+                'Preserve vault.kdbx and its backups for diagnosis.',
+            ])
+            return
+        ACTIVE_VAULT = store
+        break
+    if INBOX.exists():
+        try:
+            report = migrate(current_store())
+            details = [
+                f"Imported connections: {len(report['imported'])}",
+                f"Existing identical connections: {len(report['duplicates'])}",
+                f"Verified key pairs removed from keys/: {len(report['removed_keys'])}",
+                f"Unimported files preserved: {len(report['preserved'])}",
+                f"Import problems: {len(report['problems'])}",
+            ]
+            details += [''] + ['Imported: ' + a for a in report['imported']]
+            details += ['Preserved: ' + p for p in report['preserved']]
+            details += ['Problem: ' + p for p in report['problems']]
+            if report['backup']:
+                details.append('Verified encrypted backup: ' + report['backup'])
+            report_screen(win, 'LEGACY IMPORT REPORT', details)
+        except (VaultError, OSError, ValueError, Exception) as error:
+            report_screen(win, 'IMPORT ERROR', [str(error),
+                'Legacy keys were not deleted unless individually verified.',
+                'Check keys/ before retrying.'])
+            return
+    win.erase()
     launcher = Launcher(win)
     try:
         launcher.loop()
@@ -1224,26 +1360,28 @@ def run(win):
 
 def main() -> int:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
-        print("This launcher requires an interactive terminal.", file=sys.stderr)
+        print('SSH Vault requires an interactive terminal.', file=sys.stderr)
         return 2
-    if not shutil.which("ssh") or not shutil.which("ssh-keygen"):
-        print("OpenSSH (ssh and ssh-keygen) is required.", file=sys.stderr)
-        return 2
+    for cmd in ('ssh', 'ssh-keygen', 'ssh-agent', 'ssh-add'):
+        if not shutil.which(cmd):
+            print(f'Missing required OpenSSH utility: {cmd}', file=sys.stderr)
+            return 2
     os.umask(0o077)
     try:
         initialize_storage()
-    except OSError as error:
-        print(f"Could not initialize portable storage: {error}", file=sys.stderr)
+        from pykeepass import PyKeePass
+    except (ImportError, VaultError, OSError) as error:
+        print('SSH Vault startup error: ' + str(error), file=sys.stderr)
         return 2
     try:
         curses.wrapper(run)
     except KeyboardInterrupt:
         pass
     except Exception as error:
-        print(f"\nLauncher error: {error}", file=sys.stderr)
+        print(f'\nLauncher error: {error}', file=sys.stderr)
         return 1
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(main())

@@ -1,18 +1,26 @@
 #!/usr/bin/env bash
-# SSH Launcher - macOS (Bash 3.2), Linux y FreeBSD (con Bash).
-# Configuracion portable: raiz/keys/config, raiz/keys/priv y raiz/keys/pub.
-# No escribe en ~/.ssh local. Conexiones usando configuracion y known_hosts portables.
-# Despues de cerrar SSH, retorna automaticamente al launcher.
+# SSH Vault - macOS (Bash 3.2), Linux and FreeBSD (Bash).
+# SSH admin operations use a short-lived, private staging directory populated
+# from the encrypted vault; never write to the client machine ~/.ssh folder.
 set -u
 set -o pipefail
 umask 077
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || exit 1
 ROOT="$(cd "$APP_DIR/.." && pwd -P)" || exit 1
-SRC="$ROOT/keys"
-# IdentityFile relativas se interpretan desde el directorio raiz del launcher.
+SRC="${SSH_VAULT_WORKDIR:-$ROOT/keys}"
+# Relative IdentityFile paths are resolved from the project root.
 cd "$ROOT" || exit 1
 TEMP=""
+# Diagnostics are kept only in the operation's private temporary staging area.
+# Never log credentials, private key content, or passwords.
+DIAG_FILE="${SSH_VAULT_DIAGNOSTIC_FILE:-}"
+LAST_PHASE="starting"
+report_diagnostic() {
+  if [[ -n "$DIAG_FILE" && -f "$DIAG_FILE" && ! -L "$DIAG_FILE" ]]; then
+    printf '%s\n' "$*" >> "$DIAG_FILE" || true
+  fi
+}
 CURSOR_HIDDEN=0
 # Short-lived SSH multiplexing is used only while authorizing a new key.
 # The master connection never substitutes for the independent key_test().
@@ -64,8 +72,8 @@ else
 fi
 say() { printf '  %s\n' "$*"; }
 info() { printf '\n  %s%s%s\n' "$B$CY" "$*" "$X"; }
-warn() { printf '  %s! %s%s\n' "$YL" "$*" "$X"; }
-err() { printf '  %sERROR: %s%s\n' "$RD" "$*" "$X" >&2; }
+warn() { printf '  %s! %s%s\n' "$YL" "$*" "$X"; report_diagnostic "NOTICE: $*"; }
+err() { printf '  %sERROR: %s%s\n' "$RD" "$*" "$X" >&2; report_diagnostic "ERROR: $*"; }
 ok() { printf '  %sOK%s  %s\n' "$B$GR" "$X" "$*"; }
 show_cursor() {
   if (( CURSOR_HIDDEN )); then printf '\033[?25h'; CURSOR_HIDDEN=0; fi
@@ -92,7 +100,7 @@ check_structure() {
     err 'Config, priv/, pub/ and known_hosts must not be symlinks.'; return 1;
   }
 }
-# Rutas con espacios, comillas o barras invertidas en opciones OpenSSH.
+# Support spaces, quotes, and backslashes in OpenSSH path options.
 portable_known_hosts_option() {
   local path="$SRC/known_hosts"
   path="${path//\\/\\\\}"
@@ -104,21 +112,21 @@ valid_host() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9.:-]*$ ]]; }
 valid_user() { [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]]; }
 valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
 
-# Solo administra bloques "Host ALIAS" (uno por bloque), no patrones ni Match.
+# Manage only individual Host ALIAS blocks, not patterns or Match blocks.
 alias_exists() {
   awk -v t="$1" 'tolower($1)=="host" && NF==2 && $2==t {found=1} END {exit !found}' "$SRC/config"
 }
 list_aliases() {
   awk 'tolower($1)=="host" && NF==2 && $2 !~ /[*?]/ {print $2}' "$SRC/config"
 }
-# Selector numerico compartido por Editar y Eliminar (Bash 3.2 compatible).
-# El nombre elegido se devuelve en la variable indicada como argumento.
+# Shared alias helpers remain compatible with macOS Bash 3.2.
+# Return the selected alias to the caller.
 config_value() {
-  # Valores efectivos segun ssh -G, incluidos defaults (puerto 22).
+  # Effective OpenSSH settings from ssh -G, including default port 22.
   ssh -G -F "$SRC/config" "$1" 2>/dev/null | awk -v k="$2" '$1==k {print $2; exit}'
 }
 # Nombre de archivo de la clave; se admite "Host seafile" con "seafile-server".
-# Solo se opera sobre ficheros en keys/priv y keys/pub; NO fuera de la app.
+# Admin operations use staged keys/priv and keys/pub files only.
 key_name_for_alias() {
   local alias="$1" configured filename
   configured="$(config_value "$alias" identityfile)" || true
@@ -140,7 +148,7 @@ key_name_in_use_elsewhere() {
   done < <(list_aliases)
   return 1
 }
-# Quita solo el bloque Host ALIAS especificado, preservando todos los otros.
+# Remove exactly one Host ALIAS block, preserving all unrelated entries.
 strip_alias() {
   local file="$1" alias="$2" out="$3"
   awk -v t="$alias" '
@@ -169,18 +177,19 @@ make_temp() {
 }
 
 # SSH sin aplicar ~/.ssh/config (que puede contener un alias o clave antiguos).
-# Aceptamos nuevas host keys silenciosamente, nunca una host key que haya cambiado.
-# El codigo remoto se manda en base64 dentro del comando, SIN ocupar stdin:
-# permite los dialogos de contrasena SSH y sudo aun con pseudo-TTY.
+# Accept new host fingerprints silently, but reject changes to known fingerprints.
+# Encode remote commands as base64 without consuming stdin:
+# this keeps interactive SSH and sudo prompts available on a pseudo-TTY.
 # One SSH password prompt at most during initial key authorization.
 # Once a key is verified, other commands never fall back to password login.
 remote_run() {
-  local user="$1" host="$2" port="$3" key="$4" body="$5" auth_mode="${6:-key-only}" b64
+  local user="$1" host="$2" port="$3" key="$4" body="$5" auth_mode="${6:-key-only}" remote_shell="${7:-bash}" b64
   [[ "$auth_mode" == bootstrap || "$auth_mode" == key-only ]] || return 2
+  [[ "$remote_shell" == sh || "$remote_shell" == bash ]] || return 2
   b64="$(printf '%s\n' "$body" | base64 | tr -d '\r\n')" || return 1
   local -a cmd=(ssh -q -F /dev/null -o "$(portable_known_hosts_option)" \
     -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -p "$port" \
-    -o ConnectTimeout=12 -o ServerAliveInterval=15 -tt)
+    -o ConnectTimeout=12 -o IdentityAgent=none -o IdentitiesOnly=yes -o ServerAliveInterval=15 -tt)
   if [[ -n "$SSH_CONTROL_PATH" ]]; then
     [[ "$user" == "$SSH_CONTROL_USER" && "$host" == "$SSH_CONTROL_HOST" && "$port" == "$SSH_CONTROL_PORT" ]] || {
       err 'SSH control socket destination mismatch.'; return 1;
@@ -200,18 +209,38 @@ remote_run() {
   else
     cmd+=(-o NumberOfPasswordPrompts=1)
   fi
-  cmd+=("$user@$host" "printf '%s' '$b64' | base64 -d | bash")
-  "${cmd[@]}"
+  cmd+=("$user@$host" "printf '%s' '$b64' | base64 -d | $remote_shell")
+  local rc
+  if [[ -n "$DIAG_FILE" && -f "$DIAG_FILE" && ! -L "$DIAG_FILE" ]]; then
+    # -tt merges remote stderr into stdout. Capture both to show the actual
+    # failure in the TUI, while keeping the temporary diagnostic private.
+    "${cmd[@]}" 2>&1 | tee -a "$DIAG_FILE"
+    rc=${PIPESTATUS[0]}
+  else
+    "${cmd[@]}"
+    rc=$?
+  fi
+  if (( rc != 0 )); then
+    err "Remote SSH command failed (exit $rc) while $LAST_PHASE. Check server login permissions and remote output."
+  fi
+  return "$rc"
 }
 
 key_test() {
   local user="$1" host="$2" port="$3" key="$4"
+  local rc
   ssh -F /dev/null -o "$(portable_known_hosts_option)" -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR \
     -p "$port" -i "$key" -o IdentityAgent=none \
     -o ControlMaster=no -o ControlPath=none \
     -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=12 \
     -o PreferredAuthentications=publickey -o PasswordAuthentication=no \
-    -o KbdInteractiveAuthentication=no -T "$user@$host" true
+    -o KbdInteractiveAuthentication=no -T "$user@$host" true \
+    2> >(if [[ -n "$DIAG_FILE" && -f "$DIAG_FILE" ]]; then tee -a "$DIAG_FILE" >&2; else cat >&2; fi)
+  rc=$?
+  if ((rc != 0)); then
+    err "Public-key authentication test failed (SSH exit $rc) for $user@$host:$port."
+  fi
+  return "$rc"
 }
 password_test() {
   local user="$1" host="$2" port="$3"
@@ -221,57 +250,66 @@ password_test() {
     -o PreferredAuthentications=password,keyboard-interactive \
     -o NumberOfPasswordPrompts=1 -o ConnectTimeout=12 -T "$user@$host" true
 }
+# Generate a portable remote /bin/sh operation from the same, reviewed source
+# for Linux, FreeBSD, and macOS. No server-specific paths are embedded here.
+remote_key_body() {
+  local operation="$1" public="$2" override_marker="${3:-}" typ blob marker extra
+  [[ -f "$public" && ! -L "$public" ]] || return 1
+  read -r typ blob marker extra < "$public" || true
+  [[ "$typ" == ssh-ed25519 && "$blob" =~ ^[A-Za-z0-9+/=]+$ ]] || {
+    err 'Unsupported SSH public key.'; return 1;
+  }
+  if [[ "$operation" == adopt ]]; then
+    marker="$override_marker"
+  fi
+  if [[ "$operation" == add && "$marker" != ssh-vault-managed-* ]]; then
+    err 'The new key lacks the SSH Vault ownership marker.'; return 1
+  fi
+  if [[ ( "$operation" == remove || "$operation" == probe ) && "$marker" != ssh-vault-managed-* ]]; then
+    err 'This legacy/imported key has no SSH Vault ownership marker. Remote revocation is refused to avoid deleting another application’s authorization.'
+    return 1
+  fi
+  if [[ "$operation" == add || "$operation" == remove || "$operation" == probe ]]; then
+    [[ -z "${extra:-}" ]] || { err 'Malformed public key comment.'; return 1; }
+  fi
+  [[ "$marker" =~ ^ssh-vault-managed-[A-Za-z0-9_-]+$ ]] || {
+    err 'Unrecognized SSH Vault ownership marker.'; return 1;
+  }
+  [[ -f "$APP_DIR/remote_authorized_keys.sh" && ! -L "$APP_DIR/remote_authorized_keys.sh" ]] || {
+    err 'Portable remote key module missing.'; return 1;
+  }
+  printf "VAULT_ACTION='%s'\nVAULT_TYPE='%s'\nVAULT_BLOB='%s'\nVAULT_MARKER='%s'\n" \
+    "$operation" "$typ" "$blob" "$marker"
+  cat "$APP_DIR/remote_authorized_keys.sh"
+}
+
 remote_install_key() {
-  local user="$1" host="$2" port="$3" private="$4" public="$5" authkey="${6:-$4}" pub body
-  pub="$(cat "$public")" || return 1
-  [[ "$pub" == ssh-ed25519\ * ]] || { err 'Public key is not Ed25519.'; return 1; }
-  # La clave la emite ssh-keygen; solo se permiten caracteres seguros.
-  [[ "$pub" =~ ^[A-Za-z0-9+/=_-]+[[:space:]][A-Za-z0-9+/=]+([[:space:]][A-Za-z0-9_-]+)?$ ]] || { err 'Invalid public key format.'; return 1; }
-  body="$(cat <<EOF
-set -eu
-PUB='$pub'
-UMASK_OLD=\$(umask); umask 077
-ME=\$(id -un); MYGROUP=\$(id -gn)
-if ! (mkdir -p "\$HOME/.ssh" && touch "\$HOME/.ssh/authorized_keys" && chmod 700 "\$HOME/.ssh" && chmod 600 "\$HOME/.ssh/authorized_keys" && chmod go-w "\$HOME"); then
-  echo 'Repairing permissions/ownership using remote sudo...'
-  sudo -v
-  sudo mkdir -p "\$HOME/.ssh"
-  sudo touch "\$HOME/.ssh/authorized_keys"
-  sudo chown "\$ME:\$MYGROUP" "\$HOME/.ssh" "\$HOME/.ssh/authorized_keys"
-  sudo chmod 700 "\$HOME/.ssh"
-  sudo chmod 600 "\$HOME/.ssh/authorized_keys"
-  sudo chmod go-w "\$HOME"
-fi
-if [ -L "\$HOME/.ssh/authorized_keys" ]; then echo 'authorized_keys is a symlink; cancelled.'; exit 1; fi
-if ! grep -Fqx -- "\$PUB" "\$HOME/.ssh/authorized_keys"; then
-  printf '%s\\n' "\$PUB" >> "\$HOME/.ssh/authorized_keys"
-fi
-grep -Fqx -- "\$PUB" "\$HOME/.ssh/authorized_keys"
-echo 'Public key authorized.'
-EOF
-)"
-  # Si el alias existia, usar su clave anterior para autorizar la nueva;
-  # asi funciona incluso si el servidor ya tiene las contrasenas deshabilitadas.
-  if ! remote_run "$user" "$host" "$port" "$authkey" "$body" bootstrap; then
-    if [[ "$authkey" == "$private" ]] || ! remote_run "$user" "$host" "$port" "$private" "$body" bootstrap; then
+  local user="$1" host="$2" port="$3" private="$4" public="$5" authkey="${6:-$4}" body
+  body="$(remote_key_body add "$public")" || return 1
+  # Reuse the initial authenticated SSH channel for authorization, while an
+  # independent key-only SSH connection must pass before we persist identity.
+  if ! remote_run "$user" "$host" "$port" "$authkey" "$body" bootstrap sh; then
+    if [[ "$authkey" == "$private" ]] || ! remote_run "$user" "$host" "$port" "$private" "$body" bootstrap sh; then
       return 1
     fi
   fi
   if ! key_test "$user" "$host" "$port" "$private"; then
-    # A veces el directorio ya existia con propietario equivocado.
-    warn 'Key rejected; attempting to repair owner using sudo...'
-    body='set -eu; sudo -v; sudo chown "$(id -un):$(id -gn)" "$HOME/.ssh" "$HOME/.ssh/authorized_keys"; sudo chmod go-w "$HOME"; sudo chmod 700 "$HOME/.ssh"; sudo chmod 600 "$HOME/.ssh/authorized_keys"'
-    remote_run "$user" "$host" "$port" "$authkey" "$body" bootstrap || return 1
-    key_test "$user" "$host" "$port" "$private" || { err 'sshd rejected the key. Local files were not changed.'; return 1; }
+    warn 'Independent key-only SSH login failed; attempting to undo our own enrollment.'
+    local undo
+    undo="$(remote_key_body remove "$public")" || return 1
+    remote_run "$user" "$host" "$port" "$authkey" "$undo" bootstrap sh || \
+      warn 'Could not undo the newly authorized key. Inspect the remote managed entry manually.'
+    err 'SSH login with the new key was not verified. Nothing was saved to the vault.'
+    return 1
   fi
   return 0
 }
 
-# Cambia contrasenas SSH de todo sshd, NO la clave/clave de login del sistema.
-# Drop-in deliberadamente al comienzo (OpenSSH usa la primera opcion encontrada).
-# Se restaura el contenido anterior si sshd -t / -T / reload falla.
-# La segunda sesion prueba una conexion NUEVA sin solicitar sudo: confirma mediante
-# una marca temporal al verificador root, iniciado con el sudo de la primera sesion.
+# Change the sshd password-login policy, not the account password.
+# Place the drop-in early: OpenSSH uses the first effective directive.
+# Restore prior settings when sshd validation or reload fails.
+# A second SSH session verifies fresh access without a second sudo prompt:
+# it acknowledges the root-side verifier started by the initial sudo authentication.
 set_password() {
   local user="$1" host="$2" port="$3" key="$4" mode="$5" body guard check_body
   [[ "$mode" == yes || "$mode" == no ]] || return 1
@@ -280,6 +318,8 @@ set_password() {
   guard="gestor-ssh-guard-${RANDOM}-${RANDOM}-$$"
   body="$(cat <<EOF
 set -eu
+[ "\$(uname -s)" = Linux ] || { echo 'ERROR: Password policy changes require the Linux/systemd rollback adapter on this host; key-only SSH remains supported.' >&2; exit 1; }
+command -v systemd-run >/dev/null && command -v systemctl >/dev/null || { echo 'ERROR: The required systemd rollback service is unavailable. Server was not modified.' >&2; exit 1; }
 if [ "\$(id -u)" -eq 0 ]; then
   sudo() { if [ "\${1:-}" = -v ]; then return 0; fi; "\$@"; }
 fi
@@ -290,8 +330,8 @@ DIR="/run/\$GUARD"
 ACK_DIR="/tmp/ssh-launcher-ack-\$GUARD"
 # Sin systemd-run no podemos garantizar un rollback automatico si cae SSH.
 command -v systemd-run >/dev/null || { echo 'ERROR: systemd-run unavailable; change cancelled.'; exit 1; }
-# Directorio de acuse accesible solo para el usuario de la conexion.
-# mkdir SIN -p impide enlaces simbolicos o directorios preexistentes.
+# Acknowledgement directory accessible only to the logged-in account.
+# mkdir without -p refuses existing directories or symbolic links.
 mkdir -m 700 "\$ACK_DIR" || { echo 'ERROR: Duplicate confirmation marker.'; exit 1; }
 sudo install -d -m 700 "\$DIR"
 sudo mkdir -p /etc/ssh/sshd_config.d
@@ -328,7 +368,7 @@ restore_now() {
   sudo systemctl stop "\$GUARD-finalize.timer" >/dev/null 2>&1 || true
   rm -rf "\$ACK_DIR"
 }
-# La primera opcion efectiva gana en OpenSSH; el archivo empieza por 00.
+# OpenSSH uses the first effective option; the drop-in starts with 00.
 printf 'PubkeyAuthentication yes\\nPasswordAuthentication $mode\\nKbdInteractiveAuthentication $mode\\n' | sudo tee "\$P" >/dev/null
 sudo chmod 644 "\$P"
 SSHD=\$(command -v sshd || printf /usr/sbin/sshd)
@@ -363,8 +403,8 @@ else
   fi
 fi
 
-# El verificador en segundo plano conserva el privilegio de la PRIMERA
-# autenticacion sudo. La prueba de acceso se efectua en una nueva sesion SSH.
+# The background verifier retains privilege from the FIRST sudo
+# authentication. Access is checked in a fresh SSH session.
 printf '%s\n' "\$CONTEXT" | sudo tee "\$DIR/context" >/dev/null
 printf '%s\n' '$mode' | sudo tee "\$DIR/mode" >/dev/null
 sudo tee "\$DIR/finalize.sh" >/dev/null <<'FINALIZE_SH'
@@ -407,7 +447,7 @@ if ! sudo systemd-run --quiet --unit="\$GUARD-finalize" --on-active=1s \
 fi
 EOF
 )"
-  if ! remote_run "$user" "$host" "$port" "$key" "$body"; then
+  if ! remote_run "$user" "$host" "$port" "$key" "$body" key-only sh; then
     err 'Change not confirmed. Automatic rollback is scheduled if SSH access was lost.'
     return 1
   fi
@@ -416,7 +456,7 @@ EOF
     err 'No new SSH key session. The rollback timer remains active.'
     return 1
   fi
-  # Solo confirmar el acceso desde otra sesion SSH. No se necesita sudo aqui:
+  # Confirm access from another SSH session; sudo is not needed here:
   # un verificador root ya iniciado con el primer sudo revalida sshd -T y
   # cancela el rollback cuando recibe este acuse. Si no llega, restaura.
   check_body="$(cat <<EOF
@@ -434,7 +474,7 @@ echo 'ERROR: the server did not confirm the change; rollback pending.'
 exit 1
 EOF
 )"
-  if ! remote_run "$user" "$host" "$port" "$key" "$check_body"; then
+  if ! remote_run "$user" "$host" "$port" "$key" "$check_body" key-only sh; then
     err 'Second SSH session not confirmed. Automatic rollback remains active.'
     return 1
   fi
@@ -442,27 +482,80 @@ EOF
 }
 
 remote_revoke_key() {
-  local user="$1" host="$2" port="$3" key="$4" public="$5" pub token body
-  pub="$(cat "$public")" || return 1
-  token="$(printf '%s\n' "$pub" | awk '{print $2}')"
-  [[ "$token" =~ ^[A-Za-z0-9+/=]+$ ]] || { err 'Invalid local public key.'; return 1; }
-  body="$(cat <<EOF
-set -eu
-FILE="\$HOME/.ssh/authorized_keys"
-if [ -e "\$FILE" ]; then
-  [ ! -L "\$FILE" ] || { echo 'authorized_keys is a symlink; cancelled'; exit 1; }
-  TMP=\$(mktemp "\$HOME/.ssh/authorized_keys.XXXXXXXX") || exit 1
-  trap 'rm -f "\$TMP"' EXIT
-  awk -v token='$token' 'index(\$0,token)==0 {print}' "\$FILE" > "\$TMP"
-  chmod 600 "\$TMP"
-  cat "\$TMP" > "\$FILE"
-  chmod 600 "\$FILE"
-  if grep -Fq '$token' "\$FILE"; then echo 'Could not revoke the key'; exit 1; fi
-fi
-echo 'Public key revoked on remote server.'
-EOF
-)"
-  remote_run "$user" "$host" "$port" "$key" "$body"
+  local user="$1" host="$2" port="$3" key="$4" public="$5" body
+  body="$(remote_key_body remove "$public")" || return 1
+  remote_run "$user" "$host" "$port" "$key" "$body" key-only sh
+}
+
+# Refuse dangerous sshd setting changes and destructive operations if the
+# specific key's remote ownership has not been proved first.
+remote_probe_key() {
+  local user="$1" host="$2" port="$3" key="$4" public="$5" body
+  body="$(remote_key_body probe "$public")" || return 1
+  remote_run "$user" "$host" "$port" "$key" "$body" key-only sh
+}
+
+# An authentication failure is only proof of revocation when OpenSSH explicitly
+# rejects public-key auth. Network timeouts or host-key errors are NOT success.
+verify_key_revoked() {
+  local user="$1" host="$2" port="$3" key="$4" output rc
+  output="$(ssh -F /dev/null -o "$(portable_known_hosts_option)" \
+    -o StrictHostKeyChecking=yes -o LogLevel=ERROR \
+    -p "$port" -i "$key" -o IdentityAgent=none -o IdentitiesOnly=yes \
+    -o BatchMode=yes -o ConnectTimeout=12 -o ConnectionAttempts=1 \
+    -o PreferredAuthentications=publickey -o PasswordAuthentication=no \
+    -o KbdInteractiveAuthentication=no -o ControlMaster=no -o ControlPath=none \
+    -T "$user@$host" true 2>&1)"
+  rc=$?
+  if (( rc != 0 )) && [[ "$output" == *"Permission denied (publickey"* ]]; then
+    return 0
+  fi
+  err 'Cannot prove the key has lost remote SSH access (another provider, network error or unexpected success). Keep the vault identity and investigate.'
+  report_diagnostic "NOTICE: SSH post-revocation check: ${output:0:220}"
+  return 1
+}
+
+backend_adopt() {
+  local name="$1" host user port key_file pkey pub body marker typ blob original_line
+  check_structure || return 1
+  valid_alias "$name" && alias_exists "$name" || { err 'Invalid alias.'; return 1; }
+  key_file="$(key_name_for_alias "$name")"
+  if key_name_in_use_elsewhere "$name" "$key_file"; then
+    err 'Identity is shared by multiple aliases. Adoption requires a uniquely owned key.'; return 1
+  fi
+  pkey="$SRC/priv/$key_file"; pub="$SRC/pub/$key_file.pub"
+  [[ -f "$pkey" && ! -L "$pkey" && -f "$pub" && ! -L "$pub" ]] || {
+    err 'Missing private/public identity.'; return 1;
+  }
+  read -r typ blob _ < "$pub" || true
+  [[ "$typ" == ssh-ed25519 && "$blob" =~ ^[A-Za-z0-9+/=]+$ ]] || {
+    err 'Adoption requires an Ed25519 key.'; return 1;
+  }
+  host="$(config_value "$name" hostname)"
+  user="$(config_value "$name" user)"
+  port="$(config_value "$name" port)"
+  marker="ssh-vault-managed-$name"
+  LAST_PHASE="checking public-key authentication before adoption"
+  key_test "$user" "$host" "$port" "$pkey" || return 1
+  # Repeating after a crash is safe: same marker, no duplicate line.
+  LAST_PHASE="adopting exactly one remote key authorization"
+  body="$(remote_key_body adopt "$pub" "$marker")" || return 1
+  remote_run "$user" "$host" "$port" "$pkey" "$body" key-only sh || {
+    err 'Adoption refused; original public identity is unchanged in vault.'; return 1;
+  }
+  LAST_PHASE="confirming adopted identity remains able to authenticate"
+  key_test "$user" "$host" "$port" "$pkey" || {
+    err 'Remote authorization changed but authentication is not verified. Keep this connection and retry/review adoption.'
+    return 1
+  }
+  # Only the comment is changed; the cryptographic public key is unchanged.
+  make_temp || return 1
+  printf '%s %s %s\n' "$typ" "$blob" "$marker" > "$TEMP/adopted.pub" || return 1
+  chmod 644 "$TEMP/adopted.pub"
+  mv "$TEMP/adopted.pub" "$pub" || {
+    err 'Remote adoption succeeded, but updating staged public key failed. Re-run Adopt to recover.'; return 1;
+  }
+  ok "Remote identity adopted for $name. It is now eligible for managed revocation."
 }
 
 # Interfaz automatizable: todos los argumentos son variables, nunca evaluados como shell.
@@ -474,22 +567,35 @@ backend_create() {
   if alias_exists "$name" || [[ -e "$SRC/priv/$name" || -L "$SRC/priv/$name" || -e "$SRC/pub/$name.pub" || -L "$SRC/pub/$name.pub" ]]; then
     err 'Alias or key file already exists. Nothing was replaced.'; return 1
   fi
-  make_temp || return 1
+  make_temp || { err 'Could not create a protected temporary staging directory.'; return 1; }
   local key="$TEMP/key" pub="$TEMP/key.pub" conf="$TEMP/config"
-  ssh-keygen -q -t ed25519 -N '' -C "$name" -f "$key" || return 1
+  LAST_PHASE="generating the Ed25519 identity"
+  ssh-keygen -q -t ed25519 -N '' -C "ssh-vault-managed-$name" -f "$key" || {
+    err 'Could not generate a local Ed25519 identity.'; return 1;
+  }
   info "Authorizing key on $user@$host:$port..."
-  start_ssh_control "$user" "$host" "$port" || return 1
-  remote_install_key "$user" "$host" "$port" "$key" "$pub" || { err 'SSH authorization failed. Nothing was saved.'; return 1; }
+  LAST_PHASE="authorizing a new key on $user@$host:$port"
+  start_ssh_control "$user" "$host" "$port" || {
+    err 'Could not prepare a temporary SSH control socket.'; return 1;
+  }
+  remote_install_key "$user" "$host" "$port" "$key" "$pub" || {
+    err 'SSH key authorization or independent authentication test failed. No connection was saved.'
+    return 1
+  }
   # The newly authorized key is now independently verified; close password-backed master.
   stop_ssh_control
-  write_entry "$name" "$host" "$user" "$port" "$conf" "$SRC/config" || return 1
-  cp "$key" "$SRC/priv/$name" || return 1
-  cp "$pub" "$SRC/pub/$name.pub" || return 1
-  cp "$conf" "$SRC/config" || return 1
+  LAST_PHASE="saving the verified identity to a temporary staging area"
+  write_entry "$name" "$host" "$user" "$port" "$conf" "$SRC/config" || {
+    err 'Could not write the new SSH configuration.'; return 1;
+  }
+  cp "$key" "$SRC/priv/$name" || { err 'Could not stage the private key.'; return 1; }
+  cp "$pub" "$SRC/pub/$name.pub" || { err 'Could not stage the public key.'; return 1; }
+  cp "$conf" "$SRC/config" || { err 'Could not stage the server configuration.'; return 1; }
   chmod 600 "$SRC/config" "$SRC/priv/$name"
   chmod 644 "$SRC/pub/$name.pub"
   ok "Connection $name created. Key verified."
   if [[ "$change_pw" == no ]]; then
+    LAST_PHASE="disabling password login on the remote sshd"
     if ! set_password "$user" "$host" "$port" "$SRC/priv/$name" no; then
       warn 'Key installed, but remote password login could not be disabled.'
       return 1
@@ -530,20 +636,18 @@ backend_target() {
   local name="$1" host="$2" user="$3" port="$4" pkey pub key_file
   check_structure || return 1
   valid_alias "$name" && alias_exists "$name" && valid_host "$host" && valid_user "$user" && valid_port "$port" || { err 'Invalid arguments.'; return 1; }
-  key_file="$(key_name_for_alias "$name")"
-  pkey="$SRC/priv/$key_file"; pub="$SRC/pub/$key_file.pub"
-  [[ -f "$pkey" && ! -L "$pkey" && -f "$pub" && ! -L "$pub" ]] || { err 'A portable key pair is required to change the target.'; return 1; }
-  info "Validating new target $user@$host:$port..."
-  make_temp || return 1
-  start_ssh_control "$user" "$host" "$port" || return 1
-  remote_install_key "$user" "$host" "$port" "$pkey" "$pub" || { err 'Not verified. Configuration unchanged.'; return 1; }
-  stop_ssh_control
-  make_temp || return 1
-  write_entry "$name" "$host" "$user" "$port" "$TEMP/config" "$SRC/config" "$key_file" || return 1
-  cp "$TEMP/config" "$SRC/config" || return 1
-  chmod 600 "$SRC/config"
-  ok "Target updated: $name -> $user@$host:$port"
-  warn 'Key may remain authorized on the previous host.'
+  # Moving one credential between targets is not atomic: the old server could
+  # retain an orphan key or the new target could share an authorization store.
+  # Require explicit New -> Verify -> Delete rather than silently leaking keys.
+  if [[ "$host" != "$(config_value "$name" hostname)" ||
+        "$user" != "$(config_value "$name" user)" ||
+        "$port" != "$(config_value "$name" port)" ]]; then
+    err 'In-place remote target changes are disabled to prevent abandoned remote keys. Create and verify a NEW connection, then delete the old connection to revoke its key.'
+    return 1
+  fi
+  ok 'Target unchanged. No remote credential was modified.'
+  return 0
+
 }
 backend_password() {
   local name="$1" mode="$2" host user port pkey key_file
@@ -555,6 +659,23 @@ backend_password() {
   [[ -f "$pkey" && ! -L "$pkey" ]] || { err 'Launcher private key is missing.'; return 1; }
   set_password "$user" "$host" "$port" "$pkey" "$mode"
 }
+backend_verify() {
+  local name="$1" host user port file pkey pub
+  check_structure || return 1
+  valid_alias "$name" && alias_exists "$name" || { err 'Invalid alias.'; return 1; }
+  file="$(key_name_for_alias "$name")"
+  pkey="$SRC/priv/$file"; pub="$SRC/pub/$file.pub"
+  [[ -f "$pkey" && ! -L "$pkey" && -f "$pub" && ! -L "$pub" ]] || {
+    err 'Missing complete SSH key pair.'; return 1;
+  }
+  host="$(config_value "$name" hostname)"; user="$(config_value "$name" user)"; port="$(config_value "$name" port)"
+  LAST_PHASE="verifying independent public-key SSH authentication"
+  key_test "$user" "$host" "$port" "$pkey" || return 1
+  LAST_PHASE="verifying exact managed remote authorization"
+  remote_probe_key "$user" "$host" "$port" "$pkey" "$pub" || return 1
+  ok "Identity $name is authorized and is uniquely owned by SSH Vault."
+}
+
 backend_delete() {
   local name="$1" mode="$2" host user port pkey pub key_file shared
   check_structure || return 1
@@ -566,15 +687,33 @@ backend_delete() {
   shared=0
   if key_name_in_use_elsewhere "$name" "$key_file"; then shared=1; fi
   if (( shared )); then
-    warn 'Key is shared by another alias. Only this host entry will be removed.'
+    err 'Shared identity: cannot revoke without affecting another saved connection. Nothing deleted.'
+    return 1
   elif [[ -f "$pkey" && ! -L "$pkey" && -f "$pub" && ! -L "$pub" ]]; then
+    # Verify local ownership marking BEFORE any server-wide sshd change.
+    # Legacy/imported identities are not owned by SSH Vault and cannot be
+    # revoked automatically. The previous order enabled password login first,
+    # then discovered it could not revoke the key.
+    remote_key_body remove "$pub" >/dev/null || {
+      err 'Imported or unmarked SSH key: no remote credential was revoked, no local identity deleted, and sshd password settings were not changed.'
+      return 1
+    }
+    LAST_PHASE="verifying remote ownership before any sshd policy change"
+    remote_probe_key "$user" "$host" "$port" "$pkey" "$pub" || {
+      err 'Remote owned authorization could not be proven. Nothing deleted.'; return 1;
+    }
     if [[ "$mode" == enable_password ]]; then
       set_password "$user" "$host" "$port" "$pkey" yes || { err 'Could not enable password login. Nothing was deleted.'; return 1; }
       password_test "$user" "$host" "$port" || { err 'Password login verification failed. Nothing was deleted.'; return 1; }
     fi
-    remote_revoke_key "$user" "$host" "$port" "$pkey" "$pub" || { err 'Remote key revocation failed. No local data deleted.'; return 1; }
+    LAST_PHASE="revoking the exact SSH Vault-owned remote authorization"
+    remote_revoke_key "$user" "$host" "$port" "$pkey" "$pub" || {
+      err 'Remote key revocation failed. No vault identity deleted.'; return 1;
+    }
+    LAST_PHASE="verifying independent authentication now rejects that key"
+    verify_key_revoked "$user" "$host" "$port" "$pkey" || return 1
   else
-    warn 'No portable key pair found; only the local config entry will be deleted.'
+    err 'Missing private/public key pair. Refusing vault-only deletion.'; return 1
   fi
   make_temp || return 1
   strip_alias "$SRC/config" "$name" "$TEMP/stripped" || return 1
@@ -591,5 +730,7 @@ case "$1" in
   target)  [[ $# -eq 5 ]] || exit 2; backend_target "$2" "$3" "$4" "$5" ;;
   passwd)  [[ $# -eq 3 ]] || exit 2; backend_password "$2" "$3" ;;
   delete)  [[ $# -eq 3 ]] || exit 2; backend_delete "$2" "$3" ;;
+  adopt)   [[ $# -eq 2 ]] || exit 2; backend_adopt "$2" ;;
+  verify)  [[ $# -eq 2 ]] || exit 2; backend_verify "$2" ;;
   *) err 'Unknown command.'; exit 2 ;;
 esac
