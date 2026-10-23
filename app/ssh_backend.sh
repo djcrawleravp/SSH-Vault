@@ -29,6 +29,7 @@ SSH_CONTROL_DIR=""
 SSH_CONTROL_USER=""
 SSH_CONTROL_HOST=""
 SSH_CONTROL_PORT=""
+SSH_KEEP_CONTROL=0
 stop_ssh_control() {
   if [[ -n "$SSH_CONTROL_PATH" ]]; then
     ssh -q -F /dev/null -o "ControlPath=$SSH_CONTROL_PATH" \
@@ -48,15 +49,23 @@ start_ssh_control() {
   local user="$1" host="$2" port="$3"
   [[ -n "$TEMP" && -d "$TEMP" ]] || return 1
   stop_ssh_control
-  # UNIX socket paths have a short length limit on macOS. Use a private /tmp dir.
-  SSH_CONTROL_DIR="$(mktemp -d /tmp/ssh-launcher-mux.XXXXXXXX)" || return 1
   SSH_CONTROL_USER="$user"
   SSH_CONTROL_HOST="$host"
   SSH_CONTROL_PORT="$port"
-  SSH_CONTROL_PATH="$SSH_CONTROL_DIR/mux-%C"
+  if [[ -n "${SSH_VAULT_MUX_PATH:-}" ]]; then
+    # The Python UI owns this mode-0700 directory across both operation phases.
+    # Keep the authenticated SSH master alive while the user confirms recovery.
+    [[ -d "$(dirname "$SSH_VAULT_MUX_PATH")" && ! -L "$(dirname "$SSH_VAULT_MUX_PATH")" ]] || return 1
+    SSH_CONTROL_PATH="$SSH_VAULT_MUX_PATH"
+    SSH_CONTROL_DIR=""
+  else
+    # UNIX socket paths have a short length limit on macOS.
+    SSH_CONTROL_DIR="$(mktemp -d /tmp/ssh-launcher-mux.XXXXXXXX)" || return 1
+    SSH_CONTROL_PATH="$SSH_CONTROL_DIR/mux-%C"
+  fi
 }
 cleanup() {
-  stop_ssh_control
+  if (( ! SSH_KEEP_CONTROL )); then stop_ssh_control; fi
   if (( CURSOR_HIDDEN )); then printf '\033[?25h'; CURSOR_HIDDEN=0; fi
   [[ -z "$TEMP" || ! -d "$TEMP" ]] || rm -rf -- "$TEMP"
 }
@@ -194,7 +203,7 @@ remote_run() {
     [[ "$user" == "$SSH_CONTROL_USER" && "$host" == "$SSH_CONTROL_HOST" && "$port" == "$SSH_CONTROL_PORT" ]] || {
       err 'SSH control socket destination mismatch.'; return 1;
     }
-    cmd+=(-o ControlMaster=auto -o ControlPersist=45s -o "ControlPath=$SSH_CONTROL_PATH")
+    cmd+=(-o ControlMaster=auto -o ControlPersist=150s -o "ControlPath=$SSH_CONTROL_PATH")
   else
     cmd+=(-o ControlMaster=no -o ControlPath=none)
   fi
@@ -207,7 +216,14 @@ remote_run() {
     cmd+=(-o BatchMode=yes -o PreferredAuthentications=publickey \
       -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no)
   else
-    cmd+=(-o NumberOfPasswordPrompts=1)
+    if [[ -n "${SSH_VAULT_MUX_PATH:-}" ]]; then
+      # Never initiate a second password dialogue if the master disappears
+      # between its health check and the privileged remote operation.
+      cmd+=(-o BatchMode=yes -o PasswordAuthentication=no \
+            -o KbdInteractiveAuthentication=no)
+    else
+      cmd+=(-o NumberOfPasswordPrompts=1)
+    fi
   fi
   cmd+=("$user@$host" "printf '%s' '$b64' | base64 -d | $remote_shell")
   local rc
@@ -284,8 +300,9 @@ remote_key_body() {
 }
 
 remote_install_key() {
-  local user="$1" host="$2" port="$3" private="$4" public="$5" authkey="${6:-$4}" body
-  body="$(remote_key_body add "$public")" || return 1
+  local user="$1" host="$2" port="$3" private="$4" public="$5" authkey="${6:-$4}" operation="${7:-add}" body
+  [[ "$operation" == add || "$operation" == replace ]] || return 1
+  body="$(remote_key_body "$operation" "$public")" || return 1
   # Reuse the initial authenticated SSH channel for authorization, while an
   # independent key-only SSH connection must pass before we persist identity.
   if ! remote_run "$user" "$host" "$port" "$authkey" "$body" bootstrap sh; then
@@ -294,6 +311,10 @@ remote_install_key() {
     fi
   fi
   if ! key_test "$user" "$host" "$port" "$private"; then
+    if [[ "$operation" == replace ]]; then
+      err 'Remote replacement completed but key-only authentication is unverified. The replacement private key must be retained for recovery.'
+      return 42
+    fi
     warn 'Independent key-only SSH login failed; attempting to undo our own enrollment.'
     local undo
     undo="$(remote_key_body remove "$public")" || return 1
@@ -560,15 +581,75 @@ backend_adopt() {
 
 # Interfaz automatizable: todos los argumentos son variables, nunca evaluados como shell.
 # Se usa exclusivamente desde launcher.py; remote_run/sshd conservan las verificaciones.
+stage_new_connection() {
+  local name="$1" host="$2" user="$3" port="$4" key="$5" pub="$6" conf="$TEMP/config"
+  write_entry "$name" "$host" "$user" "$port" "$conf" "$SRC/config" || return 1
+  cp "$key" "$SRC/priv/$name" || return 1
+  cp "$pub" "$SRC/pub/$name.pub" || return 1
+  cp "$conf" "$SRC/config" || return 1
+  chmod 600 "$SRC/config" "$SRC/priv/$name"
+  chmod 644 "$SRC/pub/$name.pub"
+}
+
+
+# One authentication for a two-phase creation. The UI first performs this
+# non-destructive inspection; the master SSH connection survives while the
+# user confirms replacement in curses. The subsequent create operation uses
+# that same socket and NEVER asks again for the login password.
+backend_preflight() {
+  local name="$1" host="$2" user="$3" port="$4" body
+  check_structure || return 1
+  valid_alias "$name" && valid_host "$host" && valid_user "$user" && valid_port "$port" || {
+    err 'Invalid connection arguments.'; return 1;
+  }
+  [[ -n "${SSH_VAULT_MUX_PATH:-}" ]] || { err 'No protected SSH session socket supplied.'; return 1; }
+  make_temp || { err 'Could not prepare private temporary storage.'; return 1; }
+  start_ssh_control "$user" "$host" "$port" || return 1
+  [[ ! -e "$SSH_CONTROL_PATH" && ! -L "$SSH_CONTROL_PATH" ]] || {
+    err 'Temporary SSH session already exists; refusing socket reuse.'; return 1;
+  }
+  LAST_PHASE="authenticating once to inspect an existing managed SSH key"
+  # Authenticate the user once. The master remains active for the confirmation
+  # and enrollment, with a finite lifetime even if the UI is terminated.
+  ssh -q -fN -F /dev/null -p "$port" \
+    -o "$(portable_known_hosts_option)" \
+    -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR \
+    -o ControlMaster=yes -o "ControlPath=$SSH_CONTROL_PATH" \
+    -o ControlPersist=150s -o ConnectTimeout=12 \
+    -o IdentityAgent=none -o PubkeyAuthentication=no \
+    -o NumberOfPasswordPrompts=1 "$user@$host" || {
+      err 'Could not establish initial SSH session; nothing was changed.'; return 1;
+    }
+  body="VAULT_ACTION='inspect'
+VAULT_TYPE='ssh-ed25519'
+VAULT_BLOB='AQ=='
+VAULT_MARKER='ssh-vault-managed-$name'
+$(cat "$APP_DIR/remote_authorized_keys.sh")" || return 1
+  LAST_PHASE="checking for an old SSH Vault-managed key (read-only)"
+  # Remote status is also copied to the temporary diagnostics for the UI.
+  if ! remote_run "$user" "$host" "$port" '' "$body" bootstrap sh; then
+    err 'Could not safely inspect remote authorization; nothing changed.'
+    return 1
+  fi
+  SSH_KEEP_CONTROL=1
+}
+
 backend_create() {
-  local name="$1" host="$2" user="$3" port="$4" change_pw="${5:-keep}"
+  local name="$1" host="$2" user="$3" port="$4" change_pw="${5:-keep}" replace_old="${6:-normal}"
+  local op=add result
   check_structure || return 1
   valid_alias "$name" && valid_host "$host" && valid_user "$user" && valid_port "$port" || { err 'Invalid arguments.'; return 1; }
+  [[ "$change_pw" == keep || "$change_pw" == no ]] || { err 'Invalid password policy choice.'; return 1; }
+  [[ "$replace_old" == normal || "$replace_old" == replace ]] || { err 'Invalid replacement choice.'; return 1; }
+  if [[ "$replace_old" == replace ]]; then
+    op=replace
+    warn 'Replacing exactly one previously SSH Vault-managed key with the SAME marker. This revokes its old public key.'
+  fi
   if alias_exists "$name" || [[ -e "$SRC/priv/$name" || -L "$SRC/priv/$name" || -e "$SRC/pub/$name.pub" || -L "$SRC/pub/$name.pub" ]]; then
     err 'Alias or key file already exists. Nothing was replaced.'; return 1
   fi
   make_temp || { err 'Could not create a protected temporary staging directory.'; return 1; }
-  local key="$TEMP/key" pub="$TEMP/key.pub" conf="$TEMP/config"
+  local key="$TEMP/key" pub="$TEMP/key.pub"
   LAST_PHASE="generating the Ed25519 identity"
   ssh-keygen -q -t ed25519 -N '' -C "ssh-vault-managed-$name" -f "$key" || {
     err 'Could not generate a local Ed25519 identity.'; return 1;
@@ -578,21 +659,33 @@ backend_create() {
   start_ssh_control "$user" "$host" "$port" || {
     err 'Could not prepare a temporary SSH control socket.'; return 1;
   }
-  remote_install_key "$user" "$host" "$port" "$key" "$pub" || {
-    err 'SSH key authorization or independent authentication test failed. No connection was saved.'
+  if [[ -n "${SSH_VAULT_MUX_PATH:-}" ]]; then
+    # Never fall back to a second password authentication if the original
+    # session expired. Re-run the preflight instead.
+    ssh -q -F /dev/null -o "ControlPath=$SSH_CONTROL_PATH" \
+      -o BatchMode=yes -O check -p "$port" "$user@$host" >/dev/null 2>&1 || {
+      err 'Initial SSH session expired. No key changed; restart the operation.'; return 1;
+    }
+  fi
+  if remote_install_key "$user" "$host" "$port" "$key" "$pub" "$key" "$op"; then
+    :
+  else
+    result=$?
+    if [[ "$op" == replace && "$result" -eq 42 ]]; then
+      # It is safer to retain a key that may already be deployed remotely than
+      # to lose the replacement private key when the login check fails.
+      stage_new_connection "$name" "$host" "$user" "$port" "$key" "$pub" || return 1
+      err 'Recovery identity staged locally for encryption; remote login was NOT verified.'
+    else
+      err 'SSH key authorization or independent authentication test failed. No connection was saved.'
+    fi
     return 1
-  }
-  # The newly authorized key is now independently verified; close password-backed master.
+  fi
   stop_ssh_control
   LAST_PHASE="saving the verified identity to a temporary staging area"
-  write_entry "$name" "$host" "$user" "$port" "$conf" "$SRC/config" || {
-    err 'Could not write the new SSH configuration.'; return 1;
+  stage_new_connection "$name" "$host" "$user" "$port" "$key" "$pub" || {
+    err 'Remote identity was changed but its local staging failed; preserve the generated temporary key for recovery.'; return 1;
   }
-  cp "$key" "$SRC/priv/$name" || { err 'Could not stage the private key.'; return 1; }
-  cp "$pub" "$SRC/pub/$name.pub" || { err 'Could not stage the public key.'; return 1; }
-  cp "$conf" "$SRC/config" || { err 'Could not stage the server configuration.'; return 1; }
-  chmod 600 "$SRC/config" "$SRC/priv/$name"
-  chmod 644 "$SRC/pub/$name.pub"
   ok "Connection $name created. Key verified."
   if [[ "$change_pw" == no ]]; then
     LAST_PHASE="disabling password login on the remote sshd"
@@ -602,6 +695,7 @@ backend_create() {
     fi
   fi
 }
+
 backend_rename() {
   local old="$1" new="$2" h u p key_file new_file
   check_structure || return 1
@@ -725,7 +819,8 @@ backend_delete() {
 
 if [[ ${1:-} == '' ]]; then err 'Backend command required.'; exit 2; fi
 case "$1" in
-  create)  [[ $# -eq 6 ]] || exit 2; backend_create "$2" "$3" "$4" "$5" "$6" ;;
+  preflight) [[ $# -eq 5 ]] || exit 2; backend_preflight "$2" "$3" "$4" "$5" ;;
+  create)  [[ $# -eq 6 || $# -eq 7 ]] || exit 2; backend_create "$2" "$3" "$4" "$5" "$6" "${7:-normal}" ;;
   rename)  [[ $# -eq 3 ]] || exit 2; backend_rename "$2" "$3" ;;
   target)  [[ $# -eq 5 ]] || exit 2; backend_target "$2" "$3" "$4" "$5" ;;
   passwd)  [[ $# -eq 3 ]] || exit 2; backend_password "$2" "$3" ;;

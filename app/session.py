@@ -127,6 +127,8 @@ def login_command(alias: str, rec: dict, agent_env: dict, public: Path, known: P
             '-o', 'PreferredAuthentications=publickey',
             '-o', 'IdentitiesOnly=yes',
             '-o', f'IdentityAgent={agent_env["SSH_AUTH_SOCK"]}',
+            '-o', 'ConnectTimeout=12', '-o', 'ConnectionAttempts=1',
+            '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3',
             '-o', 'ControlMaster=no', '-o', 'ControlPath=none',
-            '-i', str(public), '-p', str(rec['port']),
+            '-tt', '-i', str(public), '-p', str(rec['port']),
             '-l', rec['user'], rec['host']]

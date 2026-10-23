@@ -1,13 +1,13 @@
 #!/bin/sh
 # SSH Vault: conservative, distribution-independent OpenSSH key ownership.
-# Inputs: VAULT_ACTION={add,adopt,probe,remove}, VAULT_TYPE, VAULT_BLOB, VAULT_MARKER.
+# Inputs: VAULT_ACTION={inspect,add,replace,adopt,probe,remove}, VAULT_TYPE, VAULT_BLOB, VAULT_MARKER.
 # Unknown key providers, ambiguous entries and unsafe files fail closed.
 set -eu
 umask 077
 export LC_ALL=C
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 notice() { printf 'NOTICE: %s\n' "$*"; }
-case "${VAULT_ACTION:-}" in add|adopt|probe|remove) : ;; *) fail 'Invalid action.' ;; esac
+case "${VAULT_ACTION:-}" in inspect|add|replace|adopt|probe|remove) : ;; *) fail 'Invalid action.' ;; esac
 [ "${VAULT_TYPE:-}" = ssh-ed25519 ] || fail 'Only Ed25519 keys can be enrolled.'
 case "${VAULT_BLOB:-}" in ''|*[!A-Za-z0-9+/=]*) fail 'Invalid public-key blob.' ;; esac
 case "${VAULT_MARKER:-}" in ssh-vault-managed-*) : ;; *) fail 'Missing vault ownership marker.' ;; esac
@@ -46,37 +46,79 @@ resolve_file_path() {
     done
 }
 
-# For DESTRUCTIVE operations require the *effective* sshd configuration.
-# Never assume the default path when another key provider might be active.
+# For adoption/removal we must inspect the real OpenSSH key sources.
+# Different OpenSSH versions/platforms accept different -C context fields.
+# Never silently swallow the actual sshd diagnostic, and never infer that a
+# default path is effective for a destructive operation.
 sshd_bin=$(command -v sshd 2>/dev/null || true)
 if [ -z "$sshd_bin" ]; then
-    for candidate in /usr/sbin/sshd /usr/local/sbin/sshd /usr/libexec/sshd; do
+    for candidate in /usr/sbin/sshd /usr/local/sbin/sshd /usr/libexec/sshd /usr/local/libexec/sshd; do
         if [ -x "$candidate" ]; then sshd_bin=$candidate; break; fi
     done
 fi
 auth_files=''
 auth_command='none'
+sshd_diagnostic=''
 if [ -n "$sshd_bin" ]; then
     client_ip=$(printf '%s\n' "${SSH_CONNECTION:-}" | awk '{print $1}')
     local_ip=$(printf '%s\n' "${SSH_CONNECTION:-}" | awk '{print $3}')
     local_port=$(printf '%s\n' "${SSH_CONNECTION:-}" | awk '{print $4}')
-    server_host=$(hostname 2>/dev/null || printf localhost)
     ssh_user=$(id -un)
-    context="user=$ssh_user,host=$server_host"
-    case "$client_ip" in *[!0-9A-Fa-f:.]*|'') : ;; *) context="$context,addr=$client_ip" ;; esac
-    case "$local_ip" in *[!0-9A-Fa-f:.]*|'') : ;; *) context="$context,laddr=$local_ip" ;; esac
-    case "$local_port" in *[!0-9]*|'') : ;; *) context="$context,lport=$local_port" ;; esac
-    effective=$("$sshd_bin" -T -C "$context" 2>/dev/null || true)
+    # Match Host means the remote CLIENT name, not hostname(1) of the server.
+    # Prefer the numeric client address unless a trusted name is available;
+    # never invent a name from the local server hostname.
+    context="user=$ssh_user"
+    case "$client_ip" in *[!0-9A-Fa-f:.]*|'') : ;; *)
+        context="$context,host=$client_ip,addr=$client_ip" ;;
+    esac
+    full_context=$context
+    case "$local_ip" in *[!0-9A-Fa-f:.]*|'') : ;; *) full_context="$full_context,laddr=$local_ip" ;; esac
+    case "$local_port" in *[!0-9]*|'') : ;; *) full_context="$full_context,lport=$local_port" ;; esac
+    # Full-context lookup first, followed by the smaller context when older
+    # sshd builds reject newer -C keys. A context-free -T is NOT trusted for
+    # revocation, because Match blocks could select a different key store.
+    if effective=$("$sshd_bin" -T -C "$full_context" 2>&1); then
+        :
+    else
+        sshd_diagnostic=$effective
+        if [ "$context" != "$full_context" ] && effective=$("$sshd_bin" -T -C "$context" 2>&1); then
+            notice 'sshd effective configuration evaluated using compatible client context.'
+        else
+            sshd_diagnostic="$sshd_diagnostic; $effective"
+            effective=''
+        fi
+    fi
     if [ -n "$effective" ]; then
         auth_files=$(printf '%s\n' "$effective" | awk '$1=="authorizedkeysfile" { for (i=2;i<=NF;i++) print $i; exit }')
-        auth_command=$(printf '%s\n' "$effective" | awk '$1=="authorizedkeyscommand" {print $2; exit}')
+        auth_command=$(printf '%s\n' "$effective" | awk '$1=="authorizedkeyscommand" {print $2; exit }')
         [ -n "$auth_command" ] || auth_command=none
     fi
+else
+    sshd_diagnostic='sshd executable not found in PATH or standard system directories'
 fi
 if [ -z "$auth_files" ]; then
-    [ "$VAULT_ACTION" = add ] || fail 'Effective AuthorizedKeysFile cannot be checked; adoption and revocation require an inspectable OpenSSH configuration.'
-    auth_files='.ssh/authorized_keys'
-    notice 'Using standard authorized_keys for enrollment; independent SSH verification required.'
+    # A conservative escape hatch for systems where sshd -T is unavailable
+    # (including some chroots, appliances or macOS configurations). We may
+    # inspect ONLY a pre-existing regular ~/.ssh/authorized_keys entry, never
+    # create or replace it for adoption/removal, and never infer other paths.
+    # Independent public-key login is checked before adoption, and rejection
+    # after removal is checked by the calling backend. If either fails, vault
+    # identity is retained. The only remote line ever changed is the EXACT key.
+    if [ "$VAULT_ACTION" = add ]; then
+        auth_files='.ssh/authorized_keys'
+        notice 'Enrollment uses standard authorized_keys because sshd -T was unavailable; independent authentication is required.'
+    elif [ "$VAULT_ACTION" = inspect ]; then
+        # Read-only preflight may also inspect an account with NO existing
+        # ~/.ssh directory. Enrollment still has to pass key-only verification.
+        auth_files='.ssh/authorized_keys'
+        notice 'Limited read-only inspection of standard authorized_keys.'
+    elif [ -e "$HOME/.ssh/authorized_keys" ] || [ -L "$HOME/.ssh/authorized_keys" ]; then
+        auth_files='.ssh/authorized_keys'
+        notice 'LIMITED INSPECTION: sshd -T unavailable; using only the existing ~/.ssh/authorized_keys. Other providers cannot be audited. Independent SSH authentication is required.'
+    else
+        printf 'DETAIL: sshd inspection: %.300s\n' "$sshd_diagnostic" >&2
+        fail 'Could not inspect effective AuthorizedKeysFile and no existing standard key file is available. No remote credentials were changed.'
+    fi
 fi
 [ "$auth_files" != none ] || fail 'Server has no AuthorizedKeysFile; an external provider cannot be managed.'
 if [ "$VAULT_ACTION" != add ] && [ "$auth_command" != none ]; then
@@ -99,7 +141,7 @@ for candidate in $auth_files; do
         final=$path
     else
         final=$(resolve_file_path "$path") || {
-            if [ "$VAULT_ACTION" = add ]; then continue; fi
+            if [ "$VAULT_ACTION" = add ] || [ "$VAULT_ACTION" = inspect ]; then continue; fi
             fail "Unsafe path or dangling symlink: $path"
         }
     fi
@@ -112,7 +154,13 @@ $final
 $final"
 done
 IFS=$old_ifs
-[ -n "$entries" ] || fail 'No inspectable AuthorizedKeysFile path.'
+if [ -z "$entries" ]; then
+    if [ "$VAULT_ACTION" = inspect ]; then
+        notice 'SSH_VAULT_STATUS=new'
+        exit 0
+    fi
+    fail 'No inspectable AuthorizedKeysFile path.'
+fi
 
 # Count actual key records, ignoring comments. The Ed25519 type+blob pair is
 # identified irrespective of pre-key restrictions containing quoted spaces.
@@ -162,7 +210,25 @@ for final in $entries; do
     if [ "$count" -gt 0 ]; then selected=$final; fi
 done
 IFS=$old_ifs
-[ "$collision_total" -eq 0 ] || fail 'Ownership marker already belongs to another public key.'
+if [ "$VAULT_ACTION" = inspect ]; then
+    # Read-only preflight. The UI can confirm a safe replacement BEFORE any
+    # write; a single authenticated SSH master persists across both phases.
+    [ "$collision_total" -le 1 ] || fail 'Multiple old managed entries use this marker; replacement is unsafe.'
+    if [ "$collision_total" -eq 1 ]; then
+        notice 'SSH_VAULT_STATUS=replace'
+    else
+        notice 'SSH_VAULT_STATUS=new'
+    fi
+    exit 0
+fi
+if [ "$VAULT_ACTION" = replace ]; then
+    # Explicit recovery of a LOST private key. Only a single existing SSH Vault
+    # entry with the SAME ownership marker is eligible for replacement.
+    [ "$collision_total" -eq 1 ] && [ "$match_total" -eq 0 ] || \
+        fail 'Safe key replacement requires exactly one stale entry with this ownership marker and no authorization for the new key.'
+else
+    [ "$collision_total" -eq 0 ] || fail 'Ownership marker already belongs to another public key.'
+fi
 [ "$foreign_total" -eq 0 ] || fail 'Identity is managed using a different marker; refusing takeover.'
 [ "$match_total" -le 1 ] || fail 'Public key is authorized in multiple entries. Refusing ambiguous adoption or revocation.'
 [ "$mark_total" -le 1 ] || fail 'Duplicate managed marker detected.'
@@ -207,10 +273,22 @@ if [ "$VAULT_ACTION" = add ]; then
     exit 0
 fi
 
-# Both ADOPT and REMOVE only touch a single matching, independently identified
-# key line. ADOPT appends a comment token; key options and existing comments are
-# preserved byte-for-byte. REMOVE deletes that line and nothing else.
-[ "$match_total" -eq 1 ] || fail 'Public key has no unique authorization in the configured key files.'
+# ADOPT/REMOVE identify an existing key by its exact public blob. REPLACE is
+# only allowed with one explicitly confirmed, uniquely marked stale key.
+if [ "$VAULT_ACTION" = replace ]; then
+    [ "$collision_total" -eq 1 ] || fail 'Old managed key cannot be identified uniquely.'
+    old_ifs=$IFS; IFS='
+'
+    for final in $entries; do
+        [ -n "$final" ] && [ -f "$final" ] || continue
+        if awk -v m="$VAULT_MARKER" '$NF==m {found=1} END{exit !found}' "$final"; then
+            selected=$final; break
+        fi
+    done
+    IFS=$old_ifs
+else
+    [ "$match_total" -eq 1 ] || fail 'Public key has no unique authorization in the configured key files.'
+fi
 [ -n "$selected" ] && [ -f "$selected" ] && [ -w "$selected" ] || fail 'Remote authorization file is not writable.'
 if [ "$VAULT_ACTION" = adopt ] && [ "$mark_total" -eq 1 ]; then
     notice "Identity already adopted with this marker in $selected."
@@ -239,6 +317,24 @@ if [ "$VAULT_ACTION" = adopt ]; then
         {hit=0; for(i=1;i<NF;i++) if($i==t && $(i+1)==b) hit=1
          if(hit) print $0 " " m; else print}
     ' "$snapshot" > "$tmp" || fail 'Cannot stage adoption.'
+elif [ "$VAULT_ACTION" = replace ]; then
+    # Preserve ALL options and comments on the old managed line. Replace just
+    # the old SSH public-key type/blob, never touch unrelated authorizations.
+    awk -v t="$VAULT_TYPE" -v b="$VAULT_BLOB" -v m="$VAULT_MARKER" '
+        $NF==m {
+            hits=0
+            for(i=1;i<NF;i++) if($i=="ssh-ed25519" && $(i+1)~/^[A-Za-z0-9+\/=]+$/) {
+                old=$i " " $(i+1); idx=index($0,old)
+                if(idx>0) {
+                    print substr($0,1,idx-1) t " " b substr($0,idx+length(old))
+                    hits++; break
+                }
+            }
+            if(hits!=1) exit 72
+            next
+        }
+        {print}
+    ' "$snapshot" > "$tmp" || fail 'Cannot safely replace the previously managed key.'
 else
     awk -v t="$VAULT_TYPE" -v b="$VAULT_BLOB" -v m="$VAULT_MARKER" '
         /^[[:space:]]*#/ {print;next}
@@ -246,8 +342,8 @@ else
          if(!hit) print}
     ' "$snapshot" > "$tmp" || fail 'Cannot stage revocation.'
 fi
-if [ "$VAULT_ACTION" = adopt ]; then
-    [ "$(marked_count "$tmp")" -eq 1 ] || fail 'Cannot verify staged adoption.'
+if [ "$VAULT_ACTION" = adopt ] || [ "$VAULT_ACTION" = replace ]; then
+    [ "$(marked_count "$tmp")" -eq 1 ] || fail 'Cannot verify staged key ownership.'
 else
     [ "$(key_count "$tmp")" -eq 0 ] || fail 'Key is still present in proposed authorization.'
 fi
@@ -257,9 +353,13 @@ cat "$tmp" > "$metadata" || fail 'Cannot prepare replacement.'
 [ ! -L "$selected" ] && cmp -s "$selected" "$snapshot" || fail 'Authorization file changed concurrently; aborting.'
 mv -f "$metadata" "$selected" || fail 'No atomic filesystem replacement available; original unchanged.'
 metadata=''
-if [ "$VAULT_ACTION" = adopt ]; then
-    [ "$(marked_count "$selected")" -eq 1 ] || fail 'Adoption not present after commit.'
-    notice "Adopted exactly one remote authorization in $selected."
+if [ "$VAULT_ACTION" = adopt ] || [ "$VAULT_ACTION" = replace ]; then
+    [ "$(marked_count "$selected")" -eq 1 ] || fail 'Managed key not present after commit.'
+    if [ "$VAULT_ACTION" = replace ]; then
+        notice "Replaced exactly one stale SSH Vault-managed key in $selected; all other entries preserved."
+    else
+        notice "Adopted exactly one remote authorization in $selected."
+    fi
 else
     [ "$(key_count "$selected")" -eq 0 ] || fail 'Key still present after revocation.'
     notice "Revoked only the adopted SSH Vault entry from $selected."

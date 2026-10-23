@@ -41,7 +41,7 @@ def put(win, y, x, content, max_width, attr=0):
         pass
 
 
-def screen(win, title, subtitle, fields, selected, message='', busy=False):
+def screen(win, title, subtitle, fields, selected, message='', busy=False, reveal=False):
     win.erase()
     h, w = win.getmaxyx()
     if w < 48 or h < 19:
@@ -61,11 +61,12 @@ def screen(win, title, subtitle, fields, selected, message='', busy=False):
     positions = []
     for i, (label, value) in enumerate(fields):
         y = top + 7 + i * 3
-        put(win, y, left + 2, label, width - 4, style(2))
+        put(win, y, left + 2, f'{label}  ({len(value)} characters)', width - 4, style(2))
         width_field = width - 6
         attr = style(3) if selected == i else style(2)
         put(win, y + 1, left + 2, ' ' * width_field, width_field, attr)
-        display = ('*' * min(len(value), width_field - 3))
+        display = (value if reveal else ('*' * len(value)))
+        display = display[-max(1, width_field - 3):]
         put(win, y + 1, left + 3, display, width_field - 2, attr)
         positions.append((left + 2, y + 1, width_field))
     button_y = top + 7 + len(fields) * 3 + 1
@@ -77,7 +78,7 @@ def screen(win, title, subtitle, fields, selected, message='', busy=False):
     put(win, button_y, x_cancel, '[ EXIT ]', 8, style(3) if selected == len(fields) + 1 else style(1))
     if message:
         put(win, min(h - 3, button_y + 2), left + 2, message, width - 4, style(4))
-    put(win, h - 2, left + 2, 'Tab: next  |  Enter: continue  |  Esc: exit  |  Mouse: select', width - 4, curses.A_DIM)
+    put(win, h - 2, left + 2, 'Tab: next | Enter: confirm | Ctrl-R: show/hide | Esc: exit', width - 4, curses.A_DIM)
     win.refresh()
     return positions, (x_primary, x_primary + len(primary), button_y), (x_cancel, x_cancel + 8, button_y)
 
@@ -103,17 +104,26 @@ def password_form(win, create, previous_error=''):
         fields.append(('Confirm master password', ''))
     selected = 0
     error = previous_error
+    reveal = False
+    # Do not accept terminal mouse reporting as password characters.
     while True:
         layout = screen(win,
                         'CREATE YOUR ENCRYPTED VAULT' if create else 'UNLOCK SSH VAULT',
                         'Use a unique password of at least 12 characters.' if create
                         else 'Enter your master password to unlock your identities.',
-                        fields, selected, error)
+                        fields, selected, error, reveal=reveal)
         try:
             key = win.get_wch()
         except curses.error:
             continue
         if isinstance(key, int) and key == curses.KEY_RESIZE:
+            continue
+        # macOS/Linux/FreeBSD may send KEY_MOUSE or keypad variants.
+        # Neither is a password character.
+        if isinstance(key, int) and key == curses.KEY_MOUSE and not layout:
+            continue
+        if key == '\x12':  # Ctrl-R: explicit, temporary password visibility
+            reveal = not reveal
             continue
         if layout is None and key not in ('\x1b', 27, '\x03'):
             continue  # Never accept invisible password input in a tiny terminal.
@@ -137,6 +147,9 @@ def password_form(win, create, previous_error=''):
                     continue
         if key in ('\x1b', 27, '\x03'):
             return None
+        if key in (curses.KEY_UP, curses.KEY_DOWN):
+            selected = (selected + (-1 if key == curses.KEY_UP else 1)) % (len(fields) + 2)
+            continue
         if key in ('\t', 9, getattr(curses, 'KEY_BTAB', -200)):
             delta = -1 if key == getattr(curses, 'KEY_BTAB', -200) else 1
             selected = (selected + delta) % (len(fields) + 2)
@@ -159,19 +172,21 @@ def password_form(win, create, previous_error=''):
                 selected = 0
                 continue
             screen(win, 'SECURING VAULT', 'Encrypting and verifying your identities...',
-                   fields, len(fields), 'Please do not close the terminal.', busy=True)
+                   [(label, '') for label, _ in fields], len(fields),
+                   'Please do not close the terminal.', busy=True)
             return first
         if selected >= len(fields):
             if key in (curses.KEY_LEFT, curses.KEY_RIGHT):
                 selected = len(fields) if selected == len(fields) + 1 else len(fields) + 1
             continue
         label, val = fields[selected]
-        if key in ('\x7f', '\b', 127, 8, curses.KEY_BACKSPACE):
+        if key in ('\x7f', '\b', 127, 8, curses.KEY_BACKSPACE,
+                   getattr(curses, 'KEY_DC', -300), getattr(curses, 'KEY_DL', -301)):
             fields[selected] = (label, val[:-1])
             error = ''
-        elif key == '\x15':  # Ctrl-U
+        elif key in ('\x15', '\x17'):  # Ctrl-U / Ctrl-W clear text
             fields[selected] = (label, '')
-        elif isinstance(key, str) and key.isprintable() and len(val) < 512:
+        elif isinstance(key, str) and len(key) == 1 and key.isprintable() and len(val) < 512:
             fields[selected] = (label, val + key)
             error = ''
 

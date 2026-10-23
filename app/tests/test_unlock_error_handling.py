@@ -47,7 +47,7 @@ def harness(monkeypatch, tmp_path, behaviors):
 
 def test_wrong_password_only_then_success(monkeypatch, tmp_path):
     prompts, reports, completed = harness(monkeypatch, tmp_path,
-                        [CredentialsError('wrong'), CredentialsError('wrong'), None])
+                        [CredentialsError('wrong'), CredentialsError('wrong'), CredentialsError('wrong'), CredentialsError('wrong'), None])
     launcher.run(types.SimpleNamespace(erase=lambda:None))
     assert len(prompts) == 3
     assert 'attempt 1' in prompts[1]
@@ -65,3 +65,11 @@ def test_non_credentials_error_must_not_reprompt(monkeypatch, tmp_path, error):
     assert reports and reports[0][0] == 'VAULT OPEN ERROR'
     assert 'NOT confirmed' in '\n'.join(reports[0][1])
     assert not completed
+
+
+def test_transient_credentials_error_retried_without_another_prompt(monkeypatch, tmp_path):
+    prompts, reports, completed = harness(monkeypatch, tmp_path,
+                                          [CredentialsError('transient'), None])
+    launcher.run(types.SimpleNamespace(erase=lambda:None))
+    assert len(prompts) == 1
+    assert not reports and completed == [True]

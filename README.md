@@ -1,5 +1,7 @@
 # SSH Vault
 
+**Release v14.2 — Single-Authentication Recovery & TUI Refinement**
+
 **One master password. Your SSH identities. Every machine.**
 
 SSH Vault is a keyboard-first, mouse-friendly terminal application for macOS, Linux, and FreeBSD. Register a remote server once, install and test its Ed25519 public key, and return to it without entering the remote account password. Optionally disable SSH password authentication on the remote server, with validation and rollback safeguards.
@@ -70,9 +72,10 @@ On first launch SSH Vault displays a **full-screen startup panel** while prepari
 3. If an existing `keys/` folder is present, SSH Vault verifies and migrates eligible connections, reporting what was imported, skipped, preserved, or cleaned.
 4. The main TUI opens. Press `N` or select **New** to register a server.
 5. Enter alias, hostname/IP, remote username (initial default `root`, then last successful user), and port (always defaults to `22`).
-6. SSH Vault creates an Ed25519 key, installs its public half remotely, verifies key-based login, then offers to disable password-based SSH login across the remote server. **No keeps the existing password setting and completes creation.**
+6. Choose whether SSH password login should be disabled after enrollment; **No keeps the existing server setting** and continues creation.
+7. The read-only preflight authenticates to the server once. If an older, uniquely marked key exists, SSH Vault presents **Replace Lost Managed Key** before modifying it. The same temporary authenticated SSH session is reused for enrollment; independent verification of the newly installed key is still required.
 
-On subsequent launches the master password is requested once in the TUI. Wrong passwords never unlock the vault; an incorrect password can be retried without erasing existing data.
+On subsequent launches the master password is requested once in the TUI. The secure editor supports common macOS/Linux/FreeBSD Delete/Backspace keys and displays an input character counter. Press **Ctrl-R** to temporarily show/hide the entered password when troubleshooting keyboard layouts; it is never logged. On a KDBX credential rejection, the same entered value is retried internally and Unicode canonical equivalents are considered when applicable. Only genuine credential rejection displays the password prompt again. No secret is persisted outside KDBX.
 
 ### Universal OpenSSH key management (Linux, macOS, FreeBSD)
 
@@ -82,7 +85,13 @@ manager runs under POSIX `/bin/sh` and follows the SSH daemon's effective
 include multiple key files, alternative paths, and the usual `%h`, `%u`, `%U`
 tokens. When those settings cannot be read, SSH Vault uses the standard
 `~/.ssh/authorized_keys` location and requires a **separate successful
-public-key login** to confirm enrollment. If `AuthorizedKeysFile none` or an
+public-key login** to confirm enrollment. For adoption and revocation, if
+`sshd -T -C` is unavailable, SSH Vault can inspect **only an already existing**
+`~/.ssh/authorized_keys` (including a safely resolved symlink) and changes
+**only the exact matching owned key**. The operation is explicitly labeled
+limited-inspection; independent key authentication and post-revocation denial
+checks remain mandatory. This cannot prove that unrelated external key providers
+are absent; if the key remains authorized elsewhere, the vault record is kept. If `AuthorizedKeysFile none` or an
 external-only `AuthorizedKeysCommand` is configured, it reports the limitation
 rather than writing an unrelated file. OpenSSH documents these options and
 restrictions in `sshd_config(5)`.
@@ -157,6 +166,7 @@ Creating an SSH identity requires a reachable host and an authentication method 
 | Connect | `Enter`, `C` | Double click or **Connect** |
 | New connection | `N` | **New** |
 | Edit / password policy / adopt / verify | `E` | **Edit** |
+| Export all identities to a new directory | `X` | **Export** |
 | Delete / revoke identity | `D` | **Delete** |
 | Search | `/`, `S` | **Search** |
 | Vault management | `V` | **Vault** or **Menu** |
@@ -206,7 +216,7 @@ SSH Vault deliberately does not silently migrate complex OpenSSH options such as
 
 ## Exporting
 
-Use **Vault → Export** to create a **new** plaintext `exported_keys/` folder containing the selected vault's connection inventory, private/public key files, and fingerprints. Exports are compatible with ordinary OpenSSH:
+Press **X** or click **Export** on the launcher footer (also available through **Vault → Export**) to create a **new** plaintext `exported_keys/` folder containing the selected vault's connection inventory, private/public key files, and fingerprints. Exports are compatible with ordinary OpenSSH:
 
 ```bash
 cd exported_keys
@@ -259,7 +269,7 @@ A portable SSH launcher should be more than a menu of `ssh` commands: **set up k
 Made for portable, auditable SSH identity management. Contributions and issue reports are welcome.
 
 
-### Unlock troubleshooting and legacy deletion safety (v12.1)
+### Unlock troubleshooting and legacy deletion safety
 
 SSH Vault only retries the master-password prompt when the KDBX reader raises
 `CredentialsError`. Corruption, incompatible data, filesystem failures or other
@@ -312,3 +322,96 @@ public key, especially when two hosts share a cluster-managed authorization
 file. To move safely, create a *new* connection with a new identity, verify its
 SSH login, then delete the original connection and confirm that revocation
 succeeds. Renaming a local alias is still supported.
+
+
+### v14 hardening / UI audit
+
+- The unlock form handles macOS Delete key sequences, shows the number of entered
+  characters, supports temporary reveal via Ctrl-R, and never logs secrets.
+- KDBX rejection is retried internally with the identical value; visually
+  equivalent Unicode compositions can be checked without requesting re-entry.
+- Remote `sshd -T -C` inspection reports actual failures, attempts a compatible
+  reduced context, and uses an existing standard `authorized_keys` file as a
+  **limited-inspection fallback** only for an exact identity match. Unknown
+  stores and ambiguous matches are refused.
+- **Export** is directly clickable and accessible with `X`. It always creates a
+  new plaintext export directory and never overwrites previous exports.
+- SSH Vault deliberately cannot guarantee universal remote key administration:
+  external identity sources, remote access policy and unusual storage backends
+  can prevent safe and complete revocation. In those cases it retains the vault
+  record rather than silently leaving an orphaned credential.
+
+**Remote filesystem compatibility:** SSH Vault does not silently fall back to an unsafe rewrite if the target filesystem refuses atomic replacement or metadata preservation (e.g. some FUSE/cluster stores). Enrollment may work while adoption/revocation must be refused. No promise of complete coverage of all SSH implementations is made.
+
+
+### v14.1 — Lost managed-key replacement and legacy login diagnostics
+
+**Normal creation never overwrites an existing remote authorization.** If the
+remote `authorized_keys` store already contains exactly one public key carrying
+`ssh-vault-managed-ALIAS`, but the original private key was lost, SSH Vault
+will offer **Replace Lost Managed Key** after the initial authentication and
+read-only remote preflight detects the collision, without showing a failed
+creation message first. Replacement requires an additional, explicit **YES** confirmation.
+
+- The replacement affects **only the uniquely identified, previously
+  SSH Vault-marked entry**, preserving every other authorization and retaining
+  any restrictions on that specific line. It does not delete arbitrary old
+  or unmarked public keys. Duplicate markers or unknown providers fail closed.
+- A prior key bearing the same marker will lose authorization. On Proxmox
+  clusters sharing their root authorization file, this may affect other nodes:
+  check that no other user or deployment still depends on that key.
+- The replacement private key is saved to the encrypted vault after verified
+  public-key login. If the remote replacement succeeds but the SSH test fails,
+  SSH Vault preserves the new key in the vault for recovery and reports its
+  status as **not verified** rather than discarding the only private key.
+- SSH private-key rotation and remote KDBX updates are not an atomic distributed
+  transaction. Keep a working password/console recovery path and a current
+  encrypted vault backup while testing this operation on production servers.
+
+**Imported LEGACY identities can connect without adoption.** Adoption is
+required for controlled remote revocation, not for public-key SSH login.
+Interactive connections now use a 12-second TCP connection timeout, one
+connection attempt, and keepalive checks, and report nonzero SSH exit codes
+inside the TUI instead of silently showing a blank terminal indefinitely.
+These network timeouts do not limit how long an established, responsive
+interactive SSH session may stay open. If the connection still fails, verify
+network reachability, username, the imported private/public key pair, and
+whether the server still authorizes the same public key.
+
+**Compatibility and validation:** This version is tested with fake remote
+OpenSSH helpers and local POSIX file operations. It cannot establish that an
+arbitrary real macOS/Linux/FreeBSD SSH server or remote network is operational.
+
+
+### v14.2 — Single-authentication key replacement & keyboard-first TUI
+
+- When registering a new connection, SSH Vault opens a short-lived,
+  project-isolated OpenSSH multiplex master and inspects the remote authorization
+  **before modifying it**. If an old `ssh-vault-managed-ALIAS` entry exists,
+  the app shows **Replace Lost Managed Key** immediately, without first showing
+  an **Operation Failed** dialog. No remote key is changed on cancellation.
+- If replacement is approved, enrollment uses the **same authenticated SSH
+  master** (one initial account-password entry), then verifies the new key via
+  a fresh, independent key-only login. If that short-lived master expires,
+  SSH Vault refuses to retry with another password silently; restart the
+  operation instead. The master socket is isolated and closed on completion
+  or cancellation. A verified encrypted backup is made before any replacement.
+- Remote `sudo` authentication, when required for changing **server-wide**
+  sshd policy, is a separate privilege authorization and cannot always be
+  combined with the initial SSH account password. SSH Vault does not persist
+  or cache either password.
+- The TUI uses a neutral text color rather than inheriting neon terminal
+  foregrounds, reserves colors for status, groups actions under a shortcut-
+  labeled clickable footer, simplifies **Edit Connection**, and wraps
+  confirmation text to the available terminal width. Keyboard navigation is
+  primary; clickable controls continue to mirror the same actions. The
+  connection wizard shows **Next**, and its editable fields support Delete,
+  Backspace and Ctrl-U.
+- Preflight on a new account without `~/.ssh/authorized_keys` is read-only:
+  it creates no remote file until confirmed enrollment is performed.
+
+**Verification limits:** automated tests use disposable fake SSH servers. The
+real KDBX integration requires `pykeepass`, and actual macOS/FreeBSD/Proxmox
+sessions should be exercised before treating a production credential migration
+or revocation as fully validated. Keep working console or password recovery
+access until independent key authentication is confirmed.
