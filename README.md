@@ -1,6 +1,6 @@
 # SSH Vault
 
-**Release v14.2 — Single-Authentication Recovery & TUI Refinement**
+**Release v14.2.3 — Safe SSH Permission Repair**
 
 **One master password. Your SSH identities. Every machine.**
 
@@ -9,6 +9,53 @@ SSH Vault is a keyboard-first, mouse-friendly terminal application for macOS, Li
 Unlike a plain SSH configuration manager, **SSH Vault encrypts its connection inventory, private and public keys, known host fingerprints, and last-used SSH username in one portable KDBX 4 database**. It uses the established KeePass file format with **Argon2id** key derivation and AES-256 encryption. The master password is not written to disk.
 
 > **Security note:** SSH passwordless sign-in uses asymmetric keys. Your SSH *private* key still controls access to the remote host. SSH Vault protects it at rest; it does not eliminate the need to guard a running, unlocked computer.
+
+## v14.2.3: automatic and conservative SSH permission repair
+
+If SSH Vault **successfully installs a new managed public key**, but a completely
+independent key-only SSH login is denied, it can now inspect and correct a very
+narrow class of remote OpenSSH `StrictModes` ownership/permission errors.
+
+The check runs **over the already-authenticated temporary SSH control session**.
+No second account-password prompt is permitted. Repairs are attempted only if:
+
+- `sshd -T -C` confirms `StrictModes yes`, public-key authentication enabled,
+  and `~/.ssh/authorized_keys` among the effective authorized-key paths;
+- `HOME`, `.ssh` and `authorized_keys` are ordinary, non-symlink paths on the
+  same filesystem, not independently mounted or hard-linked key files;
+- the process has sufficient permissions to make minimal metadata-only changes.
+
+When these checks succeed, SSH Vault can correct a mismatched owner (such as
+`root` directories unexpectedly owned by UID `100000` in a container) and
+remove unsafe **group/other write** permissions. It performs **no recursive
+`chown`**, does not change file contents, never disables `StrictModes` or
+rewrites the server's SSH configuration, and never changes other authorizations.
+After repair, it must successfully complete another **independent key-only
+SSH login** before saving the new connection to the encrypted vault.
+
+If the repair cannot be proven safe (shared key store, custom path, mountpoint,
+provider integration, missing privileges, or another root cause), the tool
+**skips the repair** and retains the existing fail-safe rollback and diagnostic
+behaviour. A denied login can also have causes unrelated to file permissions;
+SSH Vault deliberately does not try to solve these by weakening server policy.
+
+This operation modifies metadata on a remote SSH account; retain alternative
+administrative access while testing it. Rootless Unix variants, macOS and
+FreeBSD use the same portable POSIX shell helper and safe-fail rules, though
+filesystem and server differences require live validation.
+
+## v14.2.2: key-only login diagnostics
+
+When automatic repair is inapplicable or independent key authentication remains
+rejected, SSH Vault reports the available remote file metadata and effective
+`sshd` settings through the existing authenticated SSH session, without a new
+password prompt. The failure path still refuses to save unverified identities
+and attempts to undo only a newly added managed authorization. Diagnostics
+cannot replace the remote server's OpenSSH authentication logs.
+
+## v14.2.1 hotfix
+
+Fixed a `FileExistsError` that prevented new connections from being created after the remote-key preflight. Preflight and registration intentionally share an encrypted-vault staging context and a temporary SSH session, but each operation now gets its **own unique, mode-0600 diagnostic file**, removed immediately after use. This preserves the single-authentication recovery workflow and does not change vault contents or remote key management.
 
 ## Project layout
 
@@ -27,6 +74,7 @@ SSH-Vault/
     ├── session.py            # Dedicated ssh-agent and isolated admin staging
     ├── ssh_backend.sh        # SSH enrollment / remote administration
     ├── remote_authorized_keys.sh # POSIX remote key handling
+    ├── remote_permission_repair.sh # Conservative StrictModes metadata repair
     ├── requirements.txt      # pykeepass (installed into .venv/)
     └── tests/                # Regression tests
 ```
@@ -306,6 +354,7 @@ necessary before relying on destructive operations.
 python3 -m pytest -q app/tests
 bash -n app/ssh_backend.sh
 sh -n app/remote_authorized_keys.sh
+sh -n app/remote_permission_repair.sh
 ```
 
 The SSH authorization test suite uses a **fake SSH server and private HOME**.

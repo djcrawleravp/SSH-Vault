@@ -299,6 +299,95 @@ remote_key_body() {
   cat "$APP_DIR/remote_authorized_keys.sh"
 }
 
+# Read-only diagnosis after a key has been installed but fresh key-only login
+# was rejected. Reuse ONLY the pre-authenticated master connection: never ask
+# for the account password again and never change server security settings.
+remote_auth_diagnostics() {
+  local user="$1" host="$2" port="$3" body
+  [[ -n "${SSH_VAULT_MUX_PATH:-}" && -n "$SSH_CONTROL_PATH" ]] || {
+    warn 'No authenticated SSH control session available for automatic server diagnosis.'
+    return 0
+  }
+  if ! ssh -q -F /dev/null -o "ControlPath=$SSH_CONTROL_PATH" \
+       -o BatchMode=yes -O check -p "$port" "$user@$host" >/dev/null 2>&1; then
+    warn 'Initial SSH session has expired; automatic remote diagnosis skipped.'
+    return 0
+  fi
+  body="$(cat <<'REMOTE_DIAG'
+# Read-only authentication policy inspection. Never print credential contents.
+set -u
+printf 'DIAG: Remote account: %s\n' "$(id -un 2>/dev/null || printf unknown)"
+for path in "$HOME" "$HOME/.ssh" "$HOME/.ssh/authorized_keys"; do
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    ls -ld "$path" 2>/dev/null | sed 's/^/DIAG: Permissions: /'
+  else
+    printf 'DIAG: Path missing: %s\n' "$path"
+  fi
+done
+sshd_bin=$(command -v sshd 2>/dev/null || true)
+if [ -z "$sshd_bin" ]; then
+  for path in /usr/sbin/sshd /usr/local/sbin/sshd /usr/libexec/sshd /usr/local/libexec/sshd; do
+    if [ -x "$path" ]; then sshd_bin="$path"; break; fi
+  done
+fi
+if [ -n "$sshd_bin" ]; then
+  remote_user=$(id -un 2>/dev/null || true)
+  # Match-aware context based on the authenticated TCP connection.
+  client_ip=$(printf '%s\n' "${SSH_CONNECTION:-}" | awk '{print $1}')
+  local_ip=$(printf '%s\n' "${SSH_CONNECTION:-}" | awk '{print $3}')
+  local_port=$(printf '%s\n' "${SSH_CONNECTION:-}" | awk '{print $4}')
+  context="user=$remote_user"
+  case "$client_ip" in ''|*[!0-9A-Fa-f:.]*) ;; *) context="$context,host=$client_ip,addr=$client_ip" ;; esac
+  case "$local_ip" in ''|*[!0-9A-Fa-f:.]*) ;; *) context="$context,laddr=$local_ip" ;; esac
+  case "$local_port" in ''|*[!0-9]*) ;; *) context="$context,lport=$local_port" ;; esac
+  if effective=$("$sshd_bin" -T -C "$context" 2>&1); then
+    printf '%s\n' "$effective" | awk '
+      $1=="pubkeyauthentication" || $1=="permitrootlogin" ||
+      $1=="authenticationmethods" || $1=="authorizedkeysfile" ||
+      $1=="authorizedkeyscommand" || $1=="strictmodes" ||
+      $1=="pubkeyacceptedalgorithms" {if ($1 != "pubkeyacceptedalgorithms") print "DIAG: sshd " $0}
+    '
+  else
+    printf 'DIAG: Cannot obtain sshd effective configuration: %.180s\n' "$effective"
+  fi
+else
+  printf 'DIAG: sshd executable unavailable; verify server logs for key refusal.\n'
+fi
+REMOTE_DIAG
+)" || return 0
+  warn 'Key-only login was rejected. Collecting read-only SSH diagnostics through the existing authenticated session.'
+  LAST_PHASE='inspecting the remote SSH authentication policy (read-only)'
+  remote_run "$user" "$host" "$port" '' "$body" bootstrap sh || \
+    warn 'Remote policy diagnostics were unavailable. Inspect sshd authentication logs on the server.'
+  return 0
+}
+
+# On a rejected public-key login, attempt only the narrowly scoped metadata
+# repair warranted by a verified OpenSSH StrictModes policy.  Reuse the already
+# authenticated mux: never prompt for the password again.  The remote helper
+# refuses links, mountpoints, unknown key stores and missing privileges.
+remote_safe_permission_repair() {
+  local user="$1" host="$2" port="$3" body
+  [[ -n "${SSH_VAULT_MUX_PATH:-}" && -n "$SSH_CONTROL_PATH" ]] || {
+    warn 'Automatic repair unavailable without an authenticated SSH control session.'
+    return 1
+  }
+  if ! ssh -q -F /dev/null -o "ControlPath=$SSH_CONTROL_PATH" \
+      -o BatchMode=yes -O check -p "$port" "$user@$host" >/dev/null 2>&1; then
+    warn 'Authenticated control session expired; automatic repair skipped without another password prompt.'
+    return 1
+  fi
+  [[ -f "$APP_DIR/remote_permission_repair.sh" && ! -L "$APP_DIR/remote_permission_repair.sh" ]] || {
+    warn 'Automatic permission repair module is unavailable.'
+    return 1
+  }
+  body="VAULT_REPAIR_MODE='apply'
+$(cat "$APP_DIR/remote_permission_repair.sh")" || return 1
+  LAST_PHASE="safely checking remote SSH file ownership and permissions"
+  info 'Key-only login was refused. Inspecting whether local SSH permissions can be repaired safely...'
+  remote_run "$user" "$host" "$port" '' "$body" bootstrap sh
+}
+
 remote_install_key() {
   local user="$1" host="$2" port="$3" private="$4" public="$5" authkey="${6:-$4}" operation="${7:-add}" body
   [[ "$operation" == add || "$operation" == replace ]] || return 1
@@ -311,6 +400,14 @@ remote_install_key() {
     fi
   fi
   if ! key_test "$user" "$host" "$port" "$private"; then
+    # Treat a repaired key as verified ONLY after an independent new SSH
+    # connection succeeds; never use the existing mux for this check.
+    if remote_safe_permission_repair "$user" "$host" "$port" && \
+       key_test "$user" "$host" "$port" "$private"; then
+      ok 'SSH metadata repaired and new key independently authenticated.'
+      return 0
+    fi
+    remote_auth_diagnostics "$user" "$host" "$port"
     if [[ "$operation" == replace ]]; then
       err 'Remote replacement completed but key-only authentication is unverified. The replacement private key must be retained for recovery.'
       return 42

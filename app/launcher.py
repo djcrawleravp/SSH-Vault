@@ -407,7 +407,7 @@ class Launcher:
             self.win.refresh()
             return
         wide = w >= 103
-        self.put(1, 3, "◆  SSH VAULT   v14.2", style="accent")
+        self.put(1, 3, "◆  SSH VAULT   v14.2.3", style="accent")
         self.put(1, max(32, w - 30), "ENCRYPTED  •  OPENSSH", 25, "muted")
         self.put(2, 3, f"{len(self.servers)} connections  ·  {ROOT}", w - 7, "muted")
         self.rule(3, 3, w - 7)
@@ -973,27 +973,37 @@ class Launcher:
             if arguments and arguments[0] == 'delete':
                 current_store().backup_verified()
             with (nullcontext(stage) if stage is not None else backend_stage(current_store())) as stage:
-                diag_file = stage / 'operation-diagnostics.txt'
-                save_file(diag_file, b'')  # Only private temp storage; cleaned after operation.
-                env = os.environ.copy()
-                env['SSH_VAULT_WORKDIR'] = str(stage)
-                env['SSH_VAULT_DIAGNOSTIC_FILE'] = str(diag_file)
-                if mux_path is not None:
-                    env['SSH_VAULT_MUX_PATH'] = str(mux_path)
-                previous = set(current_store().data['servers'])
-                status = self.run_external(['bash', str(BACKEND)] + arguments, title,
-                                           pause=False, env=env)
-                # SSH authorization may succeed while an OPTIONAL sshd change fails.
-                updated = changed_payload(current_store(), stage)
-                saved = updated != current_store().data
-                if saved:
-                    current_store().save(updated)
-                new_servers = sorted(set(updated['servers']) - previous)
+                # A connection setup uses the SAME stage for preflight and create.
+                # The old fixed diagnostic filename caused FileExistsError on
+                # the second phase because save_file() correctly uses O_EXCL.
+                # Allocate one new mode-0600 file per operation and remove it
+                # immediately after use; never overwrite or reuse a prior log.
+                diag_fd, diag_name = tempfile.mkstemp(
+                    prefix='operation-diagnostics-', suffix='.txt', dir=str(stage))
+                os.close(diag_fd)
+                diag_file = Path(diag_name)
                 try:
-                    details = diag_file.read_text(encoding='utf-8', errors='replace').strip()
-                except OSError:
-                    details = ''
-                self.reload()
+                    env = os.environ.copy()
+                    env['SSH_VAULT_WORKDIR'] = str(stage)
+                    env['SSH_VAULT_DIAGNOSTIC_FILE'] = str(diag_file)
+                    if mux_path is not None:
+                        env['SSH_VAULT_MUX_PATH'] = str(mux_path)
+                    previous = set(current_store().data['servers'])
+                    status = self.run_external(['bash', str(BACKEND)] + arguments, title,
+                                               pause=False, env=env)
+                    # SSH authorization may succeed while an OPTIONAL sshd change fails.
+                    updated = changed_payload(current_store(), stage)
+                    saved = updated != current_store().data
+                    if saved:
+                        current_store().save(updated)
+                    new_servers = sorted(set(updated['servers']) - previous)
+                    try:
+                        details = diag_file.read_text(encoding='utf-8', errors='replace').strip()
+                    except OSError:
+                        details = ''
+                    self.reload()
+                finally:
+                    diag_file.unlink(missing_ok=True)
             self.last_backend_details = details
             if quiet:
                 return status
