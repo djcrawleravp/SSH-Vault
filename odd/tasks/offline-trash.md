@@ -1,6 +1,6 @@
 # Offline revocation trash for unreachable SSH servers
 
-Feature branch: `feat/offline-trash`. Risk: item 1 (persistent vault format) + item 3 (existing delete contract must not change).
+Feature branch: `dev` (renamed from `feat/offline-trash`). Risk: item 1 (persistent vault format) + item 3 (existing delete contract must not change).
 
 ## Specs
 
