@@ -31,10 +31,16 @@ entries; the new lifecycle fields are optional and non-destructive when absent.
 
 | ID | Specs | Route | Commit |
 |---|---|---|---|
-| T1 | S1 S2 S8 | vault.py: optional `status`/`trashed_utc`/`last_used_utc` fields + validation; session.py: preserve lifecycle fields across the staged-config round-trip | pending |
-| T2 | S1 S2 S3 S4 S5 S6 | vault.py lifecycle helpers (trash, restore, purge, expired) + tests | pending |
-| T3 | S1 S3 S4 S5 | launcher.py: trash view with restore/purge, delete-failure dialog offers trash, expiry banner on open + tests | pending |
-| T4 | S7 | README section + non-regression tests for the online delete path | pending |
+| T1 | S1 S2 S8 | vault.py: optional `status`/`trashed_utc` fields + validation; session.py: `carry_lifecycle` keeps them across the staged-config round trip | e53c762 |
+| T2 | S1 S2 S3 S4 S5 S6 | vault.py lifecycle helpers (trash, restore, purge, expired) + hermetic and real-KDBX tests | e53c762 |
+| T3 | S1 S3 S4 S5 | launcher.py: trash screen with restore/purge, delete-failure offer, expiry report on launch + UI tests | d0b0bb9 |
+| T4 | S7 | README section + no-regression test for the online delete argv contract | d0b0bb9 |
+
+All four tasks are done on `feat/offline-trash`. Verification: `PATH="$PWD/.venv/bin:$PATH"
+.venv/bin/python -m pytest -q app/tests` reports 121 passed, 2 skipped (the two skips are the
+root-only permission-repair tests). `bash -n app/ssh_backend.sh` and `sh -n
+app/remote_authorized_keys.sh`/`remote_permission_repair.sh` are clean. No backend shell file was
+modified, so the remote sequence is unchanged.
 
 ## Log
 
@@ -65,3 +71,21 @@ L6 (evidence): current delete path is network-gated at `app/ssh_backend.sh:892-8
 
 L7 (evidence): `app/session.py:34-59` rebuilds `servers` entirely from the staged config, so any new
 per-record field must be merged back explicitly or it is dropped on the next save.
+
+L8 (decision): `last_used_utc` was dropped from the design. Expiry is measured only from
+`trashed_utc`, so no per-connection write happens on every connect, and the window means exactly
+"hidden for 30 days". Expiry is derived on read and never persisted.
+
+L9 (decision, small scope expansion): trashed identities are excluded from `export_vault`. A
+connection the user asked to hide must not reappear as an unencrypted private key in
+`exported_keys/`. Pinned by `test_export_skips_trashed_identities`.
+
+L10 (observed, pre-existing): 22 tests in the suite fail when `python3` on PATH is the system
+interpreter, because the fake `ssh-keygen` stubs import `cryptography` and only `.venv` has it.
+Running the suite with `PATH="$PWD/.venv/bin:$PATH"` makes all of them pass; this is an environment
+detail, not a repository defect introduced here.
+
+L11 (verification note): the independent-verifier launch was not admitted by the harness admission
+gate, so the checks were executed inline: full suite, shell syntax, real-KDBX round trip through
+`VaultStore.save`, a grep audit that the trash path contains no `subprocess`/`ssh`/`run_backend`
+call, and a review of every `data['servers']` reader.
