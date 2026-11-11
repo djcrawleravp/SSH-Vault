@@ -26,7 +26,9 @@ from contextlib import nullcontext
 
 from vault import (VaultStore, VaultError, KDBX, ROOT, INBOX, EXPORT, BACKUPS,
                    migrate, export_vault, unb64, save_file,
-                   verify_pair)
+                   verify_pair, active_records, trashed_records, trash_record,
+                   restore_record, purge_record, expired_records, is_trashed,
+                   TRASH_DAYS)
 from session import backend_stage, changed_payload, login_agent, login_command
 
 APP = Path(__file__).resolve().parent
@@ -89,8 +91,11 @@ def locally_owned(record: dict) -> bool:
 
 
 def load_servers() -> list[Server]:
+    """Active connections only: trashed identities stay in the vault, hidden."""
     result = []
     for alias, rec in sorted(current_store().data['servers'].items()):
+        if is_trashed(rec):
+            continue
         tagged = locally_owned(rec)
         result.append(Server(alias=alias, host=rec['host'], user=rec['user'],
                              port=rec['port'], key=rec['key_name'],
@@ -99,6 +104,11 @@ def load_servers() -> list[Server]:
                                    if tagged else
                                    'Imported identity (connect normally; adopt to manage remotely)')))
     return result
+
+
+def trash_entries() -> list[tuple[str, dict]]:
+    """Hidden connections, sorted, with their stored record."""
+    return sorted(trashed_records(current_store().data['servers']).items())
 
 
 @dataclass
@@ -123,6 +133,7 @@ class Launcher:
     def __init__(self, win):
         self.win = win
         self.servers: list[Server] = []
+        self.trash: list[tuple[str, dict]] = []
         self.index = 0
         self.scroll = 0
         self.notice = ""
@@ -379,10 +390,12 @@ class Launcher:
         old = keep or (self.servers[self.index].alias if self.servers and self.index < len(self.servers) else "")
         try:
             self.servers = load_servers()
+            self.trash = trash_entries()
             self.index = next((i for i, s in enumerate(self.servers) if s.alias == old), min(self.index, len(self.servers) - 1))
             self.index = max(0, self.index)
         except Exception as exc:
             self.servers = []
+            self.trash = []
             self.index = 0
             self.notice = f"Error loading config: {exc}"
 
@@ -409,7 +422,11 @@ class Launcher:
         wide = w >= 103
         self.put(1, 3, "◆  SSH VAULT   v14.2.3", style="accent")
         self.put(1, max(32, w - 30), "ENCRYPTED  •  OPENSSH", 25, "muted")
-        self.put(2, 3, f"{len(self.servers)} connections  ·  {ROOT}", w - 7, "muted")
+        hidden = len(getattr(self, 'trash', []))
+        summary = f"{len(self.servers)} connections"
+        if hidden:
+            summary += f"  ·  {hidden} in trash"
+        self.put(2, 3, f"{summary}  ·  {ROOT}", w - 7, "warning" if hidden else "muted")
         self.rule(3, 3, w - 7)
         self.footer_rows = 2 if h >= 22 else 1
         bottom = h - 4 - self.footer_rows
@@ -1235,7 +1252,114 @@ class Launcher:
         if option == 1 and not self.confirm("FINAL CONFIRMATION", "Revoking this key could lock you out of SSH.\nConfirm that another authentication method works?", danger=True):
             return
         mode = "enable_password" if option == 0 else "keep_password"
-        self.run_backend(["delete", s.alias, mode], "DELETE CONNECTION")
+        status = self.run_backend(["delete", s.alias, mode], "DELETE CONNECTION")
+        if status != 0:
+            # An unreachable or vanished server must not trap the user in the list.
+            self.offer_trash(s.alias)
+
+    def offer_trash(self, alias):
+        """A failed remote revocation may hide the identity instead of deleting it."""
+        if not self.confirm('DELETE FAILED · MOVE TO TRASH',
+                            f"Hide '{alias}' from the connection list instead?\n"
+                            'The server is NOT contacted and nothing remote is changed.\n'
+                            f'The identity is kept and can be restored later from Vault / Trash.',
+                            yes_label='MOVE TO TRASH', no_label='KEEP AS IS'):
+            return
+        self.move_to_trash(alias)
+
+    def move_to_trash(self, preferred=None):
+        """Local-only: hide a connection without any remote operation."""
+        try:
+            data = current_store().data
+        except VaultError as error:
+            self.popup('VAULT ERROR', str(error))
+            return
+        candidates = sorted(active_records(data['servers']))
+        alias = preferred
+        if alias is None:
+            if not candidates:
+                self.popup('NOTHING TO MOVE', 'There are no active connections.')
+                return
+            choice = self.menu('MOVE TO TRASH', candidates + ['Cancel'],
+                               details='No server contact. Nothing is deleted.')
+            if choice is None or choice >= len(candidates):
+                return
+            alias = candidates[choice]
+        elif alias not in candidates:
+            self.popup('NOT FOUND', f'{alias} is not an active connection.')
+            return
+        try:
+            current_store().save(trash_record(current_store().data, alias))
+        except (VaultError, OSError, ValueError) as error:
+            self.popup('VAULT UPDATE FAILED', str(error))
+            return
+        self.reload()
+        self.notice = f'{alias} moved to trash · restore from Vault / Trash.'
+
+    def restore_from_trash(self, alias):
+        try:
+            current_store().save(restore_record(current_store().data, alias))
+        except (VaultError, OSError, ValueError) as error:
+            self.popup('RESTORE FAILED', str(error))
+            return
+        self.reload(alias)
+        self.notice = f'{alias} restored to the connection list.'
+
+    def purge_from_trash(self, alias):
+        if not self.confirm('PURGE PERMANENTLY',
+                            f'Permanently remove {alias} from the encrypted vault?\n'
+                            'The private key is destroyed and this cannot be undone.\n'
+                            'The remote server may still authorize that key, and the\n'
+                            'encrypted backups in .vault-backups/ still contain it.',
+                            danger=True, yes_label='PURGE', no_label='KEEP'):
+            return
+        try:
+            current_store().save(purge_record(current_store().data, alias))
+        except (VaultError, OSError, ValueError) as error:
+            self.popup('PURGE FAILED', str(error))
+            return
+        self.reload()
+        self.notice = f'{alias} purged from the encrypted vault.'
+
+    def trash_screen(self):
+        """Hidden connections: report expiry, restore, or purge explicitly."""
+        while True:
+            try:
+                data = current_store().data
+            except VaultError as error:
+                self.popup('VAULT ERROR', str(error))
+                return
+            trashed = trashed_records(data['servers'])
+            expired = expired_records(data)
+            if not trashed:
+                if not self.confirm('TRASH IS EMPTY',
+                                    'No hidden connections.\n\n'
+                                    'Move an active connection here without contacting it?',
+                                    yes_label='MOVE ONE', no_label='BACK'):
+                    return
+                self.move_to_trash()
+                continue
+            aliases = sorted(trashed)
+            labels = [f'{alias}  ·  {trashed[alias]["user"]}@{trashed[alias]["host"]}'
+                      + ('  ·  EXPIRED' if alias in expired else '') for alias in aliases]
+            choice = self.menu(f'TRASH · {len(aliases)} hidden',
+                               labels + ['Move another connection here'],
+                               details=f'Expired means hidden for more than {TRASH_DAYS} days. '
+                                       'Expiry is only reported; nothing is deleted automatically.')
+            if choice is None:
+                return
+            if choice >= len(aliases):
+                self.move_to_trash()
+                continue
+            alias = aliases[choice]
+            action = self.menu(f'TRASHED · {alias}', [
+                'Restore connection to the list',
+                'Purge permanently (destroys the private key)',
+            ], details=f'{trashed[alias]["user"]}@{trashed[alias]["host"]}:{trashed[alias]["port"]}')
+            if action == 0:
+                self.restore_from_trash(alias)
+            elif action == 1:
+                self.purge_from_trash(alias)
 
     def export(self):
         """Explicit plaintext export to a never-overwritten directory."""
@@ -1256,6 +1380,7 @@ class Launcher:
             'Import legacy keys/ now',
             'Export decrypted keys to NEW exported_keys/',
             'Change master password',
+            f'Trash / offline revocations ({len(getattr(self, "trash", []))})',
             'Lock vault and exit',
         ], details='Encrypted database is always the source of truth.')
         if option == 0:
@@ -1299,6 +1424,8 @@ class Launcher:
             except Exception as error:
                 self.popup('PASSWORD UPDATE FAILED', str(error))
         elif option == 3:
+            self.trash_screen()
+        elif option == 4:
             self.lock_requested = True
 
     def search(self):
@@ -1323,6 +1450,7 @@ class Launcher:
                    'Dialogs: Y/N, Tab, arrows, Enter, Esc or click\n'
                    'VAULT: identity protected in KDBX4 (not login status).\n'
                    'V: vault management · X: export all keys · Auto-lock after 10 idle minutes.\n'
+                   'Trashed connections are hidden, kept for 30 days and never auto-deleted.\n'
                    'Closing SSH returns here.')
 
     def move(self, delta):
@@ -1501,6 +1629,21 @@ def run(win):
             return
     win.erase()
     launcher = Launcher(win)
+    # Expiry is reported once per launch and NEVER purges: a wrong system clock
+    # (dead CMOS, cloned VM, restored snapshot) must not destroy identities.
+    expired = []
+    try:
+        stored = current_store().data
+    except (VaultError, OSError, ValueError, AttributeError):
+        stored = None
+    if isinstance(stored, dict):
+        expired = sorted(expired_records(stored))
+    if expired:
+        launcher.popup('TRASH · EXPIRED HIDDEN CONNECTIONS',
+                       '%d hidden connection(s) have been in the trash for more than %d days:\n%s\n\n'
+                       'Nothing was deleted. The clock alone never removes an identity.\n'
+                       'Open Vault / Trash to restore or purge them.'
+                       % (len(expired), TRASH_DAYS, ', '.join(expired)))
     try:
         launcher.loop()
     finally:

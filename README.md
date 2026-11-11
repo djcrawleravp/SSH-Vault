@@ -180,6 +180,42 @@ perfectly atomic transaction. If a remote revocation succeeds but the local
 vault write fails, the encrypted identity is intentionally retained for manual
 recovery; a warning is shown instead of falsely claiming synchronized deletion.
 
+### Offline revocation trash
+
+A remote server that no longer exists used to make **Delete** unusable: the
+authorization proof and the post-revocation check both need a reachable host, so
+there was no way to remove the entry. SSH Vault now offers a **trash** instead,
+without weakening any of those checks.
+
+When a delete fails because the server cannot be reached, the failure dialog
+offers to move the connection to the trash. The same move is available directly
+from **Vault → Trash / offline revocations → Move another connection here**, which
+never contacts the server at all.
+
+Moving to the trash:
+
+- hides the connection from the main list while keeping the identity, key pair
+  and host data in the same encrypted vault;
+- changes nothing on any remote server and never invokes `ssh`;
+- is reversible: **Restore** returns the identical identity to the list.
+
+After 30 days a trashed connection is reported as **EXPIRED** at launch and marked
+in the trash list. That report is informational: **the clock alone never deletes
+anything**. A system clock that is behind the stored timestamp cannot expire a
+record, and an unreadable timestamp is never treated as a reason to remove one.
+
+**Purge** is the only destructive step and requires its own confirmation. It
+removes the record and destroys the private key from the vault. It does **not**
+revoke anything on the server, and the encrypted backups in `.vault-backups/`
+still contain that private key, so a purged identity can remain authorized
+remotely. Treat the trash as bookkeeping, not as revocation. Trashed identities
+are deliberately excluded from the plaintext export.
+
+Stored as two optional per-connection fields (`status`, `trashed_utc`); the vault
+schema stays `version: 1`, so older releases still open it. An older release shows
+trashed connections as ordinary ones, so inspect before saving from an older
+version.
+
 For revocation, SSH Vault stages an updated file alongside the original,
 checks the source has not changed and uses an atomic rename. **Special
 filesystems that cannot support safe replacement (including some cluster
