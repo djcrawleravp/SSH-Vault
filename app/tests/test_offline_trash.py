@@ -261,3 +261,22 @@ def test_real_kdbx_still_opens_records_without_lifecycle_fields(tmp_path):
     reopened = vault.VaultStore('correct horse battery staple', path=path)
     reopened.open()
     assert not vault.is_trashed(reopened.data['servers']['a'])
+
+
+# --- F6: an impossible date is a vault error, never a ValueError -----------
+
+def test_parse_stamp_rejects_an_impossible_date():
+    with pytest.raises(vault.VaultError):
+        vault.parse_stamp('2026-13-45T99:00:00Z')
+
+
+def test_validation_raises_vault_error_for_an_impossible_date():
+    with pytest.raises(vault.VaultError):
+        vault.validate_server(record(status='trashed', trashed_utc='2026-13-45T99:00:00Z'))
+
+
+def test_future_trash_timestamp_is_never_expired():
+    future = record(status='trashed', trashed_utc='2099-01-01T00:00:00Z')
+    data = payload(a=future)
+    assert vault.expired_records(data, moment=days_later(9999)) == {}
+    assert vault.expired_records(data, moment=days_later(31)) == {}

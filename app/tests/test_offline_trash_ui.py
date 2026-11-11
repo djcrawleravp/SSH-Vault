@@ -25,12 +25,14 @@ class DummyStore:
     def __init__(self, data):
         self.data = data
         self.saved = 0
+        self.backups = 0
 
     def save(self, data):
         self.data = data
         self.saved += 1
 
     def backup_verified(self):
+        self.backups += 1
         return Path('/dev/null')
 
 
@@ -94,16 +96,6 @@ def test_online_delete_keeps_its_exact_backend_contract(monkeypatch):
     assert ui.run_backend.call_args[0][0] == ['delete', 'a', 'enable_password']
     assert ui.run_backend.call_args[0][1] == 'DELETE CONNECTION'
     assert ui.confirm.call_args[0][0] == 'DELETE CONNECTION'
-
-
-def test_legacy_delete_is_still_refused_locally(monkeypatch):
-    ui, store = make_ui(monkeypatch, {'a': tagged()}, menu=0)
-    ui.selected = lambda: server(kind='LEGACY')
-    ui.delete()
-    assert ui.run_backend.call_count == 0
-    assert store.saved == 0
-    title = ui.popup.call_args[0][0]
-    assert 'ADOPTION REQUIRED' == title
 
 
 # --- S1/S5: the deliberate, offline path ------------------------------------
@@ -202,3 +194,71 @@ def test_trashed_connections_are_not_listed(monkeypatch):
     listed = [s.alias for s in launcher.load_servers()]
     assert listed == ['b']
     assert [alias for alias, _ in launcher.trash_entries()] == ['a']
+
+
+# --- F2/F5: the purge disclosure must be true, not reassuring --------------
+
+def test_purge_writes_a_verified_backup_first(monkeypatch):
+    trashed = tagged(status='trashed', trashed_utc='2024-01-01T00:00:00Z')
+    ui, store = make_ui(monkeypatch, {'a': trashed}, confirm=True)
+    ui.purge_from_trash('a')
+    assert store.backups == 1
+    assert store.saved == 1
+
+
+def test_purge_message_admits_exports_and_missing_revocation(monkeypatch):
+    trashed = tagged(status='trashed', trashed_utc='2024-01-01T00:00:00Z')
+    ui, store = make_ui(monkeypatch, {'a': trashed}, confirm=True)
+    ui.purge_from_trash('a')
+    message = ui.confirm.call_args[0][1]
+    assert 'exported_keys' in message
+    assert 'does NOT revoke' in message
+    assert 'cannot be undone' in message
+
+
+# --- F3: an unmanaged identity can leave the list without being revoked ----
+
+def test_legacy_delete_never_calls_the_backend(monkeypatch):
+    ui, store = make_ui(monkeypatch, {'a': tagged()}, confirm=False)
+    ui.selected = lambda: server(kind='LEGACY')
+    ui.delete()
+    assert ui.run_backend.call_count == 0
+    assert store.saved == 0
+    assert ui.confirm.call_args[0][0] == 'ADOPTION REQUIRED'
+
+
+def test_legacy_delete_offers_the_trash_instead_of_a_dead_end(monkeypatch):
+    ui, store = make_ui(monkeypatch, {'a': tagged()}, confirm=True)
+    ui.selected = lambda: server(kind='LEGACY')
+    ui.delete()
+    assert ui.run_backend.call_count == 0
+    assert store.saved == 1
+    assert vault.is_trashed(store.data['servers']['a'])
+
+
+# --- S4: the launch report is read-only and precise -----------------------
+
+def test_expired_at_launch_reports_only_old_trash(monkeypatch):
+    old = tagged(status='trashed', trashed_utc='2020-01-01T00:00:00Z')
+    fresh = tagged(status='trashed', trashed_utc=vault.utc_stamp())
+    ui, store = make_ui(monkeypatch, {'old': old, 'fresh': fresh})
+    assert launcher.expired_at_launch() == ['old']
+    assert store.saved == 0
+
+
+def test_expired_at_launch_tolerates_a_store_without_data(monkeypatch):
+    monkeypatch.setattr(launcher, 'current_store', lambda: object())
+    assert launcher.expired_at_launch() == []
+
+
+# --- F8: a trashed alias is refused before any remote work ----------------
+
+def test_create_refuses_an_alias_that_is_in_the_trash(monkeypatch):
+    trashed = tagged(status='trashed', trashed_utc='2024-01-01T00:00:00Z')
+    ui, store = make_ui(monkeypatch, {'a': trashed})
+    ui.trash = [('a', trashed)]
+    ui.prompt = Mock(return_value='a')
+    ui.create()
+    assert ui.popup.call_args[0][0] == 'ALIAS IN TRASH'
+    assert ui.run_backend.call_count == 0
+    assert store.saved == 0

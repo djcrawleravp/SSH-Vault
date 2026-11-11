@@ -190,7 +190,9 @@ without weakening any of those checks.
 When a delete fails because the server cannot be reached, the failure dialog
 offers to move the connection to the trash. The same move is available directly
 from **Vault → Trash / offline revocations → Move another connection here**, which
-never contacts the server at all.
+never contacts the server at all. Imported **LEGACY** identities, which Delete
+refuses because their remote ownership cannot be proven, can be trashed from that
+same menu: hiding is not deletion.
 
 Moving to the trash:
 
@@ -199,22 +201,26 @@ Moving to the trash:
 - changes nothing on any remote server and never invokes `ssh`;
 - is reversible: **Restore** returns the identical identity to the list.
 
-After 30 days a trashed connection is reported as **EXPIRED** at launch and marked
-in the trash list. That report is informational: **the clock alone never deletes
-anything**. A system clock that is behind the stored timestamp cannot expire a
-record, and an unreadable timestamp is never treated as a reason to remove one.
+After 30 days or more a trashed connection is reported as **EXPIRED** at launch and
+marked in the trash list. That report is informational: **the clock alone never
+deletes anything**. A system clock that is behind the stored timestamp cannot
+expire a record, and an unreadable timestamp is never treated as a reason to
+remove one.
 
 **Purge** is the only destructive step and requires its own confirmation. It
-removes the record and destroys the private key from the vault. It does **not**
-revoke anything on the server, and the encrypted backups in `.vault-backups/`
-still contain that private key, so a purged identity can remain authorized
-remotely. Treat the trash as bookkeeping, not as revocation. Trashed identities
-are deliberately excluded from the plaintext export.
+writes a verified encrypted backup first, then removes the record and destroys
+the private key from the vault. It does **not** revoke anything on the server, so
+a purged identity can remain authorized remotely. The backup it just wrote, and
+any earlier plaintext export in `exported_keys/`, still contain that private key.
+Treat the trash as bookkeeping, not as revocation. Trashed identities are
+deliberately excluded from new plaintext exports.
 
 Stored as two optional per-connection fields (`status`, `trashed_utc`); the vault
-schema stays `version: 1`, so older releases still open it. An older release shows
-trashed connections as ordinary ones, so inspect before saving from an older
-version.
+schema stays `version: 1`, so older releases still open it. **Do not save the
+vault with an older release while anything is in the trash:** the older writer
+rebuilds every record from the generated SSH configuration and therefore
+silently reactivates trashed connections, discarding their hidden state. Upgrade
+first, or restore before running an older release.
 
 For revocation, SSH Vault stages an updated file alongside the original,
 checks the source has not changed and uses an atomic rename. **Special

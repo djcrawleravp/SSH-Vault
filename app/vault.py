@@ -93,7 +93,12 @@ def utc_stamp(moment=None) -> str:
 def parse_stamp(value) -> datetime:
     if not isinstance(value, str) or not STAMP_RE.fullmatch(value):
         raise VaultError('Invalid vault timestamp')
-    return datetime.strptime(value, STAMP_FORMAT).replace(tzinfo=timezone.utc)
+    try:
+        return datetime.strptime(value, STAMP_FORMAT).replace(tzinfo=timezone.utc)
+    except ValueError:
+        # Regex-valid but impossible dates (month 13, hour 99) must never
+        # escape as ValueError: callers treat VaultError as "ignore, keep data".
+        raise VaultError('Invalid vault timestamp') from None
 
 
 def is_trashed(record: dict) -> bool:

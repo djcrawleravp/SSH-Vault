@@ -111,6 +111,17 @@ def trash_entries() -> list[tuple[str, dict]]:
     return sorted(trashed_records(current_store().data['servers']).items())
 
 
+def expired_at_launch() -> list[str]:
+    """Reported once per launch; expiry never purges or writes anything."""
+    try:
+        stored = current_store().data
+    except (VaultError, OSError, ValueError, AttributeError):
+        return []
+    if not isinstance(stored, dict):
+        return []
+    return sorted(expired_records(stored))
+
+
 @dataclass
 class Mouse:
     x: int
@@ -1068,6 +1079,13 @@ class Launcher:
         if alias in [s.alias for s in self.servers]:
             self.popup("ALREADY EXISTS", "Alias already exists in config. Choose Edit.")
             return
+        hidden = [a for a, _ in getattr(self, 'trash', [])]
+        if alias in hidden:
+            # Fail here instead of after a preflight and a possible replace prompt.
+            self.popup('ALIAS IN TRASH',
+                       f"'{alias}' is hidden in the offline trash and still owns that name.\n"
+                       'Restore or purge it from Vault / Trash before reusing the alias.')
+            return
         host = self.prompt("NEW CONNECTION · 2/4", "IP address or DNS hostname:", button_label='NEXT')
         if host is None:
             return
@@ -1236,9 +1254,15 @@ class Launcher:
         if not s:
             return
         if s.key_kind != 'TAGGED':
-            self.popup('ADOPTION REQUIRED',
-                       'This imported key has no Vault ownership marker.\n'
-                       'Open Edit / Adopt Remote Key first. No local or remote key was removed.')
+            # Hiding is not deletion, so an unmanaged identity may still leave the
+            # list. No remote credential is revoked and the vault record survives.
+            if self.confirm('ADOPTION REQUIRED',
+                            'This imported key has no Vault ownership marker, so it\n'
+                            'cannot be deleted or revoked.\n\n'
+                            'Hide it in the offline trash instead? The server is not\n'
+                            'contacted, nothing is deleted and it can be restored.',
+                            yes_label='MOVE TO TRASH', no_label='BACK'):
+                self.move_to_trash(s.alias)
             return
         if not self.confirm("DELETE CONNECTION", f"Delete '{s.alias}' and revoke its key on host {s.host}?\nThis cannot be undone; you could lose SSH access.", danger=True):
             return
@@ -1261,8 +1285,10 @@ class Launcher:
         """A failed remote revocation may hide the identity instead of deleting it."""
         if not self.confirm('DELETE FAILED · MOVE TO TRASH',
                             f"Hide '{alias}' from the connection list instead?\n"
-                            'The server is NOT contacted and nothing remote is changed.\n'
-                            f'The identity is kept and can be restored later from Vault / Trash.',
+                            'No local identity is deleted and nothing is revoked.\n'
+                            'If the attempt did reach the server, its SSH password\n'
+                            'setting may already have changed: verify it separately.\n'
+                            'The identity can be restored later from Vault / Trash.',
                             yes_label='MOVE TO TRASH', no_label='KEEP AS IS'):
             return
         self.move_to_trash(alias)
@@ -1309,11 +1335,15 @@ class Launcher:
         if not self.confirm('PURGE PERMANENTLY',
                             f'Permanently remove {alias} from the encrypted vault?\n'
                             'The private key is destroyed and this cannot be undone.\n'
-                            'The remote server may still authorize that key, and the\n'
-                            'encrypted backups in .vault-backups/ still contain it.',
+                            'A verified encrypted backup is written first, so\n'
+                            f'{BACKUPS} and any earlier plaintext export in\n'
+                            'exported_keys/ may still contain that private key.\n'
+                            'Purging does NOT revoke the remote authorization.',
                             danger=True, yes_label='PURGE', no_label='KEEP'):
             return
         try:
+            # The disclosure above is only true because this backup exists.
+            current_store().backup_verified()
             current_store().save(purge_record(current_store().data, alias))
         except (VaultError, OSError, ValueError) as error:
             self.popup('PURGE FAILED', str(error))
@@ -1631,13 +1661,7 @@ def run(win):
     launcher = Launcher(win)
     # Expiry is reported once per launch and NEVER purges: a wrong system clock
     # (dead CMOS, cloned VM, restored snapshot) must not destroy identities.
-    expired = []
-    try:
-        stored = current_store().data
-    except (VaultError, OSError, ValueError, AttributeError):
-        stored = None
-    if isinstance(stored, dict):
-        expired = sorted(expired_records(stored))
+    expired = expired_at_launch()
     if expired:
         launcher.popup('TRASH · EXPIRED HIDDEN CONNECTIONS',
                        '%d hidden connection(s) have been in the trash for more than %d days:\n%s\n\n'
