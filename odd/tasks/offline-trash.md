@@ -27,6 +27,19 @@ S7. Online delete behaviour is unchanged: same exit codes, same messages, same r
 S8. The vault stays `version: 1`. An older reader must still open a vault that contains trashed
 entries; the new lifecycle fields are optional and non-destructive when absent.
 
+S9. A delete that completes and verifies its remote revocation also archives the identity in the
+trash instead of erasing it: same key material, same restore capability, nothing lost.
+
+S10. The trash distinguishes a verified revocation from an unverified offline move. A record whose
+remote revocation was proven carries `revoked_utc`; a record moved while the server was unreachable
+does not. The trash list shows both states.
+
+S11. Restoring a verified-revoked entry warns that the remote authorization is gone and the key must
+be installed again; restoring an unverified entry warns that the remote key may still be authorized.
+
+S12. Creating a connection whose alias is held by a trashed entry offers to purge that entry and
+continue, instead of only refusing.
+
 ## Tasks
 
 | ID | Specs | Route | Commit |
@@ -35,6 +48,7 @@ entries; the new lifecycle fields are optional and non-destructive when absent.
 | T2 | S1 S2 S3 S4 S5 S6 | vault.py lifecycle helpers (trash, restore, purge, expired) + hermetic and real-KDBX tests | e53c762 |
 | T3 | S1 S3 S4 S5 | launcher.py: trash screen with restore/purge, delete-failure offer, expiry report on launch + UI tests | d0b0bb9 |
 | T4 | S7 | README section + no-regression test for the online delete argv contract | d0b0bb9 |
+| T5 | S9 S10 S11 S12 | vault.py `archive_record`/`is_revoked`/`revoked_utc`; launcher archives after a verified delete, shows both trash states, warns on restore, offers purge-and-continue on alias reuse | pending |
 
 All four tasks are done on `feat/offline-trash`. Verification: `PATH="$PWD/.venv/bin:$PATH"
 .venv/bin/python -m pytest -q app/tests` reports 121 passed, 2 skipped (the two skips are the
@@ -89,3 +103,27 @@ L11 (verification note): the independent-verifier launch was not admitted by the
 gate, so the checks were executed inline: full suite, shell syntax, real-KDBX round trip through
 `VaultStore.save`, a grep audit that the trash path contains no `subprocess`/`ssh`/`run_backend`
 call, and a review of every `data['servers']` reader.
+
+L12 (user, verbatim): "me parece que ya que implementamos trash que siempre vaya a trash habiendo
+hecho la revocacion pero que mantenga en trash la maenra de restaurarlo no? y que se comporte de la
+misma manera que cuando el server no esta disponible que opinas? y si, arregla esas 6 mejoras
+menores"
+
+L13 (correction): the advisory count reported to the user as "6 minor improvements" was wrong. The
+approved review emitted 14 advisory findings (ids R1-001, R2-001..006, R3-001..005, R4-1, R4-2) and
+`R3-001` was already refuted. Their descriptions are not recoverable: the transaction store keeps only
+ids, lens, location and severity. Each cited location was therefore inspected directly and only
+genuine defects were fixed; unfounded ones are listed in L14 rather than invented.
+
+L14 (finding triage): fixed - `move_to_trash` caught only `VaultError` while the vault read can raise
+`OSError`/`ValueError`; `purge_from_trash` and `move_to_trash` called `current_store()` twice per
+operation; the launch report left the idle timer at its old value so the popup could be followed by an
+immediate auto-lock; the trash list built its labels with a conditional expression inside a
+comprehension and could not express the new revoked state. Judged sound and left alone - the version
+banner text, the help line wording, and the empty-trash confirmation copy: they are accurate, merely
+terse, and rewriting them would add churn without changing behaviour.
+
+L15 (design decision): after a VERIFIED revocation the remote authorization is gone, so restoring the
+record cannot restore connectivity. The trash therefore records `revoked_utc` only when the
+revocation was proven, the list shows REVOKED vs NOT REVOKED, and restore warns accordingly instead of
+implying the connection works again.

@@ -38,7 +38,7 @@ def carry_lifecycle(record: dict, previous: dict) -> dict:
     this merge a trashed connection would silently become active again on the
     next administrative save.
     """
-    for field in ('status', 'trashed_utc'):
+    for field in ('status', 'trashed_utc', 'revoked_utc'):
         if field in previous:
             record[field] = previous[field]
     return record

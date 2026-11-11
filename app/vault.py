@@ -105,6 +105,11 @@ def is_trashed(record: dict) -> bool:
     return record.get('status', STATUS_ACTIVE) == STATUS_TRASHED
 
 
+def is_revoked(record: dict) -> bool:
+    """True only when a remote revocation was actually proven."""
+    return isinstance(record.get('revoked_utc'), str)
+
+
 def active_records(servers: dict) -> dict:
     return {alias: record for alias, record in servers.items()
             if not is_trashed(record)}
@@ -139,7 +144,27 @@ def restore_record(data: dict, alias: str) -> dict:
         return updated
     record.pop('status', None)
     record.pop('trashed_utc', None)
+    record.pop('revoked_utc', None)
     validate_server(record)
+    return updated
+
+
+def archive_record(data: dict, alias: str, record: dict, revoked=False, moment=None) -> dict:
+    """Keep a deleted identity in the trash instead of destroying it.
+
+    `revoked` asserts that the remote authorization was verified gone. Without it
+    the record must be treated as possibly still authorized on the server.
+    """
+    validate_server(record)
+    stored = copy.deepcopy(record)
+    stored['status'] = STATUS_TRASHED
+    stored['trashed_utc'] = utc_stamp(moment)
+    stored.pop('revoked_utc', None)
+    if revoked:
+        stored['revoked_utc'] = utc_stamp(moment)
+    validate_server(stored)
+    updated = copy.deepcopy(data)
+    updated['servers'][alias] = stored
     return updated
 
 
@@ -195,8 +220,13 @@ def validate_server(record: dict) -> None:
         raise VaultError('Invalid connection status in vault')
     if status == STATUS_TRASHED:
         parse_stamp(record.get('trashed_utc'))
-    elif 'trashed_utc' in record:
-        parse_stamp(record['trashed_utc'])
+    else:
+        if 'trashed_utc' in record:
+            parse_stamp(record['trashed_utc'])
+        if 'revoked_utc' in record:
+            raise VaultError('A connection that is not in the trash cannot be revoked')
+    if 'revoked_utc' in record:
+        parse_stamp(record['revoked_utc'])
 
 
 def verify_pair(private: bytes, public: bytes) -> bool:

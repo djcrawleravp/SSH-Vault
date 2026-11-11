@@ -280,3 +280,46 @@ def test_future_trash_timestamp_is_never_expired():
     data = payload(a=future)
     assert vault.expired_records(data, moment=days_later(9999)) == {}
     assert vault.expired_records(data, moment=days_later(31)) == {}
+
+
+# --- S9/S10: archiving a verified revocation -------------------------------
+
+def test_archive_record_marks_a_proven_revocation():
+    archived = vault.archive_record(payload(), 'b', record(), revoked=True, moment=MOMENT)
+    stored = archived['servers']['b']
+    assert vault.is_trashed(stored)
+    assert vault.is_revoked(stored)
+    assert stored['revoked_utc'] == STAMP
+    assert 'b' not in vault.active_records(archived['servers'])
+
+
+def test_archive_record_without_proof_leaves_revocation_unset():
+    archived = vault.archive_record(payload(), 'b', record(), moment=MOMENT)
+    stored = archived['servers']['b']
+    assert vault.is_trashed(stored)
+    assert not vault.is_revoked(stored)
+    assert 'revoked_utc' not in stored
+
+
+def test_archive_record_keeps_an_already_trashed_record_consistent():
+    stale = record(status='trashed', trashed_utc=STAMP, revoked_utc=STAMP)
+    archived = vault.archive_record(payload(a=stale), 'a', stale, revoked=False, moment=MOMENT)
+    assert not vault.is_revoked(archived['servers']['a'])
+
+
+def test_validation_rejects_a_revocation_on_an_active_connection():
+    with pytest.raises(vault.VaultError):
+        vault.validate_server(record(revoked_utc=STAMP))
+
+
+def test_validation_rejects_an_impossible_revocation_date():
+    with pytest.raises(vault.VaultError):
+        vault.validate_server(record(status='trashed', trashed_utc=STAMP,
+                                     revoked_utc='2026-13-45T99:00:00Z'))
+
+
+def test_carry_lifecycle_preserves_the_revocation_proof():
+    previous = record(status='trashed', trashed_utc=STAMP, revoked_utc=STAMP)
+    merged = session.carry_lifecycle(record(), previous)
+    assert vault.is_revoked(merged)
+    assert merged['trashed_utc'] == STAMP

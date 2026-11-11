@@ -79,12 +79,18 @@ def test_failed_delete_keeps_the_server_when_the_user_declines(monkeypatch):
     assert not vault.is_trashed(store.data['servers']['a'])
 
 
-def test_successful_delete_never_moves_to_trash(monkeypatch):
+def test_successful_delete_archives_the_identity_as_revoked(monkeypatch):
+    """S9/S10: a verified delete keeps the identity, marked as revoked."""
     ui, store = make_ui(monkeypatch, {'a': tagged()}, menu=1)
     ui.run_backend = Mock(return_value=0)
     ui.selected = lambda: server()
     ui.delete()
-    assert store.saved == 0
+    assert store.saved == 1
+    archived = store.data['servers']['a']
+    assert vault.is_trashed(archived)
+    assert vault.is_revoked(archived)
+    assert archived['revoked_utc'] == archived['trashed_utc']
+    assert archived['private'] == tagged()['private']
 
 
 def test_online_delete_keeps_its_exact_backend_contract(monkeypatch):
@@ -253,12 +259,61 @@ def test_expired_at_launch_tolerates_a_store_without_data(monkeypatch):
 
 # --- F8: a trashed alias is refused before any remote work ----------------
 
-def test_create_refuses_an_alias_that_is_in_the_trash(monkeypatch):
+def test_create_offers_to_purge_an_alias_held_by_the_trash(monkeypatch):
+    """S12: always-archive must not make an alias permanently unusable."""
     trashed = tagged(status='trashed', trashed_utc='2024-01-01T00:00:00Z')
-    ui, store = make_ui(monkeypatch, {'a': trashed})
+    ui, store = make_ui(monkeypatch, {'a': trashed}, confirm=True)
     ui.trash = [('a', trashed)]
     ui.prompt = Mock(return_value='a')
     ui.create()
-    assert ui.popup.call_args[0][0] == 'ALIAS IN TRASH'
-    assert ui.run_backend.call_count == 0
+    assert ui.confirm.call_args[0][0] == 'ALIAS IN TRASH'
+    assert store.saved == 1
+    assert store.backups == 1
+    assert 'a' not in store.data['servers']
+
+
+def test_create_keeps_a_trashed_alias_when_the_user_cancels(monkeypatch):
+    trashed = tagged(status='trashed', trashed_utc='2024-01-01T00:00:00Z')
+    ui, store = make_ui(monkeypatch, {'a': trashed}, confirm=False)
+    ui.trash = [('a', trashed)]
+    ui.prompt = Mock(return_value='a')
+    ui.create()
     assert store.saved == 0
+    assert vault.is_trashed(store.data['servers']['a'])
+
+
+# --- S10/S11: the two trash states must never be conflated ------------------
+
+def test_trash_label_states_whether_revocation_was_proven():
+    assert launcher.Launcher.trash_label('a', tagged(), False).endswith('NOT REVOKED')
+    revoked = tagged(revoked_utc='2024-01-01T00:00:00Z')
+    assert launcher.Launcher.trash_label('a', revoked, True).endswith('REVOKED · EXPIRED')
+
+
+def test_restore_of_a_revoked_identity_warns_that_it_will_not_connect(monkeypatch):
+    revoked = tagged(status='trashed', trashed_utc='2024-01-01T00:00:00Z',
+                     revoked_utc='2024-01-01T00:00:00Z')
+    ui, store = make_ui(monkeypatch, {'a': revoked}, confirm=True)
+    ui.restore_from_trash('a')
+    warning = ui.confirm.call_args[0][1]
+    assert 'does NOT' in warning
+    assert 'install the key' in warning
+    assert store.saved == 1
+
+
+def test_restore_of_an_unverified_identity_says_it_may_still_be_authorized(monkeypatch):
+    trashed = tagged(status='trashed', trashed_utc='2024-01-01T00:00:00Z')
+    ui, store = make_ui(monkeypatch, {'a': trashed}, confirm=True)
+    ui.restore_from_trash('a')
+    warning = ui.confirm.call_args[0][1]
+    assert 'may still accept' in warning or 'never verified revoked' in warning
+
+
+def test_purge_message_for_a_revoked_identity_does_not_claim_it_is_still_authorized(monkeypatch):
+    revoked = tagged(status='trashed', trashed_utc='2024-01-01T00:00:00Z',
+                     revoked_utc='2024-01-01T00:00:00Z')
+    ui, store = make_ui(monkeypatch, {'a': revoked}, confirm=True)
+    ui.purge_from_trash('a')
+    message = ui.confirm.call_args[0][1]
+    assert 'verified revoked' in message
+    assert 'may still authorize' not in message

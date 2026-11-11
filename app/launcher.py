@@ -28,7 +28,7 @@ from vault import (VaultStore, VaultError, KDBX, ROOT, INBOX, EXPORT, BACKUPS,
                    migrate, export_vault, unb64, save_file,
                    verify_pair, active_records, trashed_records, trash_record,
                    restore_record, purge_record, expired_records, is_trashed,
-                   TRASH_DAYS)
+                   is_revoked, archive_record, TRASH_DAYS)
 from session import backend_stage, changed_payload, login_agent, login_command
 
 APP = Path(__file__).resolve().parent
@@ -1081,11 +1081,20 @@ class Launcher:
             return
         hidden = [a for a, _ in getattr(self, 'trash', [])]
         if alias in hidden:
-            # Fail here instead of after a preflight and a possible replace prompt.
-            self.popup('ALIAS IN TRASH',
-                       f"'{alias}' is hidden in the offline trash and still owns that name.\n"
-                       'Restore or purge it from Vault / Trash before reusing the alias.')
-            return
+            # Settle the name here instead of failing after a remote preflight.
+            if not self.confirm('ALIAS IN TRASH',
+                                f"'{alias}' is hidden in the offline trash and still owns\n"
+                                'that name.\n\nPurge the trashed identity permanently and\n'
+                                'continue? A verified encrypted backup is written first.',
+                                danger=True, yes_label='PURGE AND CONTINUE', no_label='CANCEL'):
+                return
+            try:
+                current_store().backup_verified()
+                current_store().save(purge_record(current_store().data, alias))
+            except (VaultError, OSError, ValueError) as error:
+                self.popup('PURGE FAILED', str(error))
+                return
+            self.reload()
         host = self.prompt("NEW CONNECTION · 2/4", "IP address or DNS hostname:", button_label='NEXT')
         if host is None:
             return
@@ -1276,10 +1285,31 @@ class Launcher:
         if option == 1 and not self.confirm("FINAL CONFIRMATION", "Revoking this key could lock you out of SSH.\nConfirm that another authentication method works?", danger=True):
             return
         mode = "enable_password" if option == 0 else "keep_password"
+        record = current_store().data['servers'].get(s.alias)
         status = self.run_backend(["delete", s.alias, mode], "DELETE CONNECTION")
         if status != 0:
             # An unreachable or vanished server must not trap the user in the list.
             self.offer_trash(s.alias)
+            return
+        # The revocation was verified, so the key is dead remotely. Keeping the
+        # identity itself makes an accidental delete recoverable.
+        self.archive_deleted(s.alias, record)
+
+    def archive_deleted(self, alias, record):
+        """Keep a verified-revoked identity in the trash instead of erasing it."""
+        if not record:
+            return
+        try:
+            current_store().save(archive_record(current_store().data, alias,
+                                                 record, revoked=True))
+        except (VaultError, OSError, ValueError) as error:
+            self.popup('REVOKED BUT NOT ARCHIVED',
+                       f'{alias} was revoked on the server, but its identity could not be\n'
+                       f'kept in the vault: {error}\n'
+                       'The connection is no longer in the list.')
+        else:
+            self.notice = f'{alias} revoked · kept in trash for {TRASH_DAYS} days.'
+        self.reload()
 
     def offer_trash(self, alias):
         """A failed remote revocation may hide the identity instead of deleting it."""
@@ -1296,8 +1326,9 @@ class Launcher:
     def move_to_trash(self, preferred=None):
         """Local-only: hide a connection without any remote operation."""
         try:
-            data = current_store().data
-        except VaultError as error:
+            store = current_store()
+            data = store.data
+        except (VaultError, OSError, ValueError) as error:
             self.popup('VAULT ERROR', str(error))
             return
         candidates = sorted(active_records(data['servers']))
@@ -1315,7 +1346,7 @@ class Launcher:
             self.popup('NOT FOUND', f'{alias} is not an active connection.')
             return
         try:
-            current_store().save(trash_record(current_store().data, alias))
+            store.save(trash_record(data, alias))
         except (VaultError, OSError, ValueError) as error:
             self.popup('VAULT UPDATE FAILED', str(error))
             return
@@ -1324,32 +1355,70 @@ class Launcher:
 
     def restore_from_trash(self, alias):
         try:
-            current_store().save(restore_record(current_store().data, alias))
+            store = current_store()
+            data = store.data
+        except (VaultError, OSError, ValueError) as error:
+            self.popup('RESTORE FAILED', str(error))
+            return
+        record = data['servers'].get(alias, {})
+        if is_revoked(record):
+            warning = (f'{alias} was revoked on the server, so restoring it does NOT\n'
+                       'restore the connection: the remote key is gone.\n\n'
+                       'Restore the identity anyway? You will need to install the key\n'
+                       'again on that host before it can authenticate.')
+        else:
+            warning = (f'Restore {alias} to the connection list?\n\n'
+                       'Its remote authorization was never verified revoked, so the\n'
+                       'server may still accept that key.')
+        if not self.confirm('RESTORE CONNECTION', warning,
+                            yes_label='RESTORE', no_label='CANCEL'):
+            return
+        try:
+            store.save(restore_record(data, alias))
         except (VaultError, OSError, ValueError) as error:
             self.popup('RESTORE FAILED', str(error))
             return
         self.reload(alias)
-        self.notice = f'{alias} restored to the connection list.'
+        self.notice = (f'{alias} restored · install the key again before connecting.'
+                       if is_revoked(record) else f'{alias} restored to the connection list.')
 
     def purge_from_trash(self, alias):
+        try:
+            store = current_store()
+            data = store.data
+        except (VaultError, OSError, ValueError) as error:
+            self.popup('PURGE FAILED', str(error))
+            return
+        revoked = is_revoked(data['servers'].get(alias, {}))
+        remote = ('The remote authorization was verified revoked, so that server no\n'
+                  'longer accepts this key.' if revoked else
+                  'The remote server may still authorize this key: purging does NOT revoke it.')
         if not self.confirm('PURGE PERMANENTLY',
                             f'Permanently remove {alias} from the encrypted vault?\n'
                             'The private key is destroyed and this cannot be undone.\n'
                             'A verified encrypted backup is written first, so\n'
                             f'{BACKUPS} and any earlier plaintext export in\n'
                             'exported_keys/ may still contain that private key.\n'
-                            'Purging does NOT revoke the remote authorization.',
+                            + remote,
                             danger=True, yes_label='PURGE', no_label='KEEP'):
             return
         try:
             # The disclosure above is only true because this backup exists.
-            current_store().backup_verified()
-            current_store().save(purge_record(current_store().data, alias))
+            store.backup_verified()
+            store.save(purge_record(data, alias))
         except (VaultError, OSError, ValueError) as error:
             self.popup('PURGE FAILED', str(error))
             return
         self.reload()
         self.notice = f'{alias} purged from the encrypted vault.'
+
+    @staticmethod
+    def trash_label(alias, record, expired):
+        """One line per hidden connection, stating whether revocation was proven."""
+        state = 'REVOKED' if is_revoked(record) else 'NOT REVOKED'
+        if expired:
+            state += ' · EXPIRED'
+        return f'{alias}  ·  {record["user"]}@{record["host"]}  ·  {state}'
 
     def trash_screen(self):
         """Hidden connections: report expiry, restore, or purge explicitly."""
@@ -1370,8 +1439,8 @@ class Launcher:
                 self.move_to_trash()
                 continue
             aliases = sorted(trashed)
-            labels = [f'{alias}  ·  {trashed[alias]["user"]}@{trashed[alias]["host"]}'
-                      + ('  ·  EXPIRED' if alias in expired else '') for alias in aliases]
+            labels = [self.trash_label(alias, trashed[alias], alias in expired)
+                      for alias in aliases]
             choice = self.menu(f'TRASH · {len(aliases)} hidden',
                                labels + ['Move another connection here'],
                                details=f'Expired means hidden for more than {TRASH_DAYS} days. '
@@ -1668,6 +1737,8 @@ def run(win):
                        'Nothing was deleted. The clock alone never removes an identity.\n'
                        'Open Vault / Trash to restore or purge them.'
                        % (len(expired), TRASH_DAYS, ', '.join(expired)))
+        # The report itself is idle time: do not let it trigger an instant auto-lock.
+        launcher.last_activity = time.monotonic()
     try:
         launcher.loop()
     finally:

@@ -172,8 +172,9 @@ supplied by `AuthorizedKeysCommand`, adoption fails without changing anything.
 **Delete** requires a uniquely tagged authorization; first it checks ownership
 without changing the remote server's password policy. Then it removes only the
 matching public-key record and checks that a new independent key-only login is
-explicitly rejected before it deletes the encrypted vault identity. It NEVER
-performs a `vault-only` deletion of an unmanaged identity.
+explicitly rejected before it removes the connection from the list. The identity
+itself is not erased: it is archived in the offline trash marked as revoked (see
+below). Delete NEVER performs a `vault-only` deletion of an unmanaged identity.
 
 Network and disk operations across two different machines cannot form one
 perfectly atomic transaction. If a remote revocation succeeds but the local
@@ -201,6 +202,24 @@ Moving to the trash:
 - changes nothing on any remote server and never invokes `ssh`;
 - is reversible: **Restore** returns the identical identity to the list.
 
+A completed **Delete** now ends in the trash too, so an accidental removal is
+recoverable. Every hidden entry carries one of two states, and they are never
+conflated:
+
+| State | Meaning |
+|---|---|
+| **REVOKED** | The remote revocation was verified: the server rejected the key before the record was archived. |
+| **NOT REVOKED** | The server was unreachable or refused, so the key may still be authorized remotely. |
+
+**Restore** says which one applies. Restoring a REVOKED identity brings back the
+alias, host, user and key material, but **not** the connection: the remote
+authorization is gone, so the key has to be installed on that host again before
+it can authenticate. Restoring a NOT REVOKED identity restores the connection as
+it was, with a warning that the server may still accept that key.
+
+Reusing the alias of a hidden connection offers to purge the trashed entry and
+continue, so archiving an identity never makes its name permanently unusable.
+
 After 30 days or more a trashed connection is reported as **EXPIRED** at launch and
 marked in the trash list. That report is informational: **the clock alone never
 deletes anything**. A system clock that is behind the stored timestamp cannot
@@ -209,18 +228,19 @@ remove one.
 
 **Purge** is the only destructive step and requires its own confirmation. It
 writes a verified encrypted backup first, then removes the record and destroys
-the private key from the vault. It does **not** revoke anything on the server, so
-a purged identity can remain authorized remotely. The backup it just wrote, and
-any earlier plaintext export in `exported_keys/`, still contain that private key.
-Treat the trash as bookkeeping, not as revocation. Trashed identities are
-deliberately excluded from new plaintext exports.
+the private key from the vault. Its wording follows the entry's state: for a NOT
+REVOKED identity it states plainly that the server may still authorize the key,
+and purging never revokes anything. The backup it just wrote, and any earlier
+plaintext export in `exported_keys/`, still contain that private key. Treat the
+trash as bookkeeping, not as revocation. Trashed identities are deliberately
+excluded from new plaintext exports.
 
-Stored as two optional per-connection fields (`status`, `trashed_utc`); the vault
-schema stays `version: 1`, so older releases still open it. **Do not save the
-vault with an older release while anything is in the trash:** the older writer
-rebuilds every record from the generated SSH configuration and therefore
-silently reactivates trashed connections, discarding their hidden state. Upgrade
-first, or restore before running an older release.
+Stored as three optional per-connection fields (`status`, `trashed_utc`,
+`revoked_utc`); the vault schema stays `version: 1`, so older releases still open
+it. **Do not save the vault with an older release while anything is in the
+trash:** the older writer rebuilds every record from the generated SSH
+configuration and therefore silently reactivates trashed connections, discarding
+their hidden state. Upgrade first, or restore before running an older release.
 
 For revocation, SSH Vault stages an updated file alongside the original,
 checks the source has not changed and uses an atomic rename. **Special
