@@ -78,6 +78,100 @@ def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+TRASH_DAYS = 30
+STAMP_FORMAT = '%Y-%m-%dT%H:%M:%SZ'
+STAMP_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$')
+STATUS_ACTIVE = 'active'
+STATUS_TRASHED = 'trashed'
+STATUSES = (STATUS_ACTIVE, STATUS_TRASHED)
+
+
+def utc_stamp(moment=None) -> str:
+    return (moment or datetime.now(timezone.utc)).strftime(STAMP_FORMAT)
+
+
+def parse_stamp(value) -> datetime:
+    if not isinstance(value, str) or not STAMP_RE.fullmatch(value):
+        raise VaultError('Invalid vault timestamp')
+    return datetime.strptime(value, STAMP_FORMAT).replace(tzinfo=timezone.utc)
+
+
+def is_trashed(record: dict) -> bool:
+    return record.get('status', STATUS_ACTIVE) == STATUS_TRASHED
+
+
+def active_records(servers: dict) -> dict:
+    return {alias: record for alias, record in servers.items()
+            if not is_trashed(record)}
+
+
+def trashed_records(servers: dict) -> dict:
+    return {alias: record for alias, record in servers.items()
+            if is_trashed(record)}
+
+
+def trash_record(data: dict, alias: str, moment=None) -> dict:
+    """Hide a connection without destroying it: local, reversible, no remote call."""
+    if alias not in data['servers']:
+        raise VaultError(f'Unknown connection: {alias}')
+    updated = copy.deepcopy(data)
+    record = updated['servers'][alias]
+    if is_trashed(record):
+        return updated
+    record['status'] = STATUS_TRASHED
+    record['trashed_utc'] = utc_stamp(moment)
+    validate_server(record)
+    return updated
+
+
+def restore_record(data: dict, alias: str) -> dict:
+    """Return a trashed connection to the active list, identity untouched."""
+    if alias not in data['servers']:
+        raise VaultError(f'Unknown connection: {alias}')
+    updated = copy.deepcopy(data)
+    record = updated['servers'][alias]
+    if not is_trashed(record):
+        return updated
+    record.pop('status', None)
+    record.pop('trashed_utc', None)
+    validate_server(record)
+    return updated
+
+
+def purge_record(data: dict, alias: str) -> dict:
+    """Explicit destruction. Only a trashed entry may be purged."""
+    record = data['servers'].get(alias)
+    if record is None:
+        raise VaultError(f'Unknown connection: {alias}')
+    if not is_trashed(record):
+        raise VaultError('Refusing to purge a connection that is not in the trash')
+    updated = copy.deepcopy(data)
+    del updated['servers'][alias]
+    return updated
+
+
+def expired_records(data: dict, days: int = TRASH_DAYS, moment=None) -> dict:
+    """Derived from the stored stamp, never persisted.
+
+    A clock behind the stored timestamp under-reports instead of destroying, and
+    an unreadable stamp is never a reason to delete anything.
+    """
+    now = moment or datetime.now(timezone.utc)
+    expired = {}
+    for alias, record in data['servers'].items():
+        if not is_trashed(record):
+            continue
+        try:
+            stamp = parse_stamp(record.get('trashed_utc'))
+        except VaultError:
+            continue
+        if now < stamp:
+            continue
+        if (now - stamp).days >= days:
+            expired[alias] = record
+    return expired
+
+
 def validate_server(record: dict) -> None:
     if not isinstance(record, dict):
         raise VaultError('Invalid server record')
@@ -91,6 +185,13 @@ def validate_server(record: dict) -> None:
         if not isinstance(record.get(field), str):
             raise VaultError('Missing SSH key material')
         unb64(record[field])
+    status = record.get('status', STATUS_ACTIVE)
+    if status not in STATUSES:
+        raise VaultError('Invalid connection status in vault')
+    if status == STATUS_TRASHED:
+        parse_stamp(record.get('trashed_utc'))
+    elif 'trashed_utc' in record:
+        parse_stamp(record['trashed_utc'])
 
 
 def verify_pair(private: bytes, public: bytes) -> bool:
@@ -513,6 +614,9 @@ def export_vault(store: VaultStore, root: Path = ROOT) -> Path:
         filenames = {}
         for alias, rec in sorted(store.data['servers'].items()):
             validate_server(rec)
+            if is_trashed(rec):
+                # A hidden identity must not reappear in a plaintext export.
+                continue
             name = rec['key_name']
             pair = (unb64(rec['private']), unb64(rec['public']))
             if name in filenames and filenames[name] != pair:

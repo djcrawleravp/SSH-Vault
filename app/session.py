@@ -31,6 +31,19 @@ def config_text(servers: dict) -> str:
     return '\n'.join(stanzas) + '\n'
 
 
+def carry_lifecycle(record: dict, previous: dict) -> dict:
+    """Keep the vault lifecycle state across the staged-config round trip.
+
+    The generated OpenSSH config cannot express vault-only fields, so without
+    this merge a trashed connection would silently become active again on the
+    next administrative save.
+    """
+    for field in ('status', 'trashed_utc'):
+        if field in previous:
+            record[field] = previous[field]
+    return record
+
+
 def changed_payload(store: VaultStore, stage: Path) -> dict:
     """Re-read admin command output; reject partial/corrupt pairs."""
     updated = copy.deepcopy(store.data)
@@ -53,6 +66,7 @@ def changed_payload(store: VaultStore, stage: Path) -> dict:
         record = {'host': opts['hostname'], 'user': opts['user'],
                   'port': str(opts['port']), 'key_name': name,
                   'private': b64(priv_bytes), 'public': b64(pub_bytes)}
+        carry_lifecycle(record, store.data['servers'].get(alias, {}))
         validate_server(record)
         if alias in existing:
             raise VaultError('Duplicate staged host alias')
